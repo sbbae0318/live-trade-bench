@@ -25,6 +25,13 @@ NEWS_DATA_FILE = os.path.join(BACKEND_ROOT, "news_data.json")
 SOCIAL_DATA_FILE = os.path.join(BACKEND_ROOT, "social_data.json")
 SYSTEM_DATA_FILE = os.path.join(BACKEND_ROOT, "system_data.json")
 
+def get_test_model_configs() -> List[Tuple[str, str]]:
+    return [
+        ("GPT-5", "openai/gpt-5"),
+        ("GPT-4.1", "openai/gpt-4.1"),
+        ("GPT-4o", "openai/gpt-4o"),
+        ("GPT-o3", "openai/o3-2025-04-16"),
+    ]
 
 def get_base_model_configs() -> List[Tuple[str, str]]:
     return [

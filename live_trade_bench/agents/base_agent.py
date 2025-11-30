@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 
+import polars as pl
 from ..accounts import BaseAccount
 from ..utils.agent_utils import normalize_allocations, parse_llm_response_to_json
 
@@ -22,16 +23,15 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
         self.price_history: Dict[str, List[float]] = defaultdict(list)
         self.last_llm_input = None
         self.last_llm_output = None
+        self.lookback_days = 10
 
     def generate_allocation(
         self,
-        market_data: Dict[str, DataType],
+        market_data: pl.DataFrame,
         account_data: Dict[str, Any],
         date: str | None = None,
         news_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, float]]:
-        if not market_data or not self.available:
-            return None
 
         try:
             market_analysis = self._prepare_market_analysis(market_data)
@@ -56,9 +56,9 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
                 "timestamp": datetime.now().isoformat(),
             }
 
-            print("\n--- LLM PROMPT ---")
-            print(messages[0]["content"])
-            print("--- END LLM PROMPT ---\n")
+            #print("\n--- LLM PROMPT ---")
+            #print(messages[0]["content"])
+            #print("--- END LLM PROMPT ---\n")
 
             llm_response = self._call_llm(messages)
 
@@ -121,7 +121,7 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
                 if timestamp_str:
                     try:
                         date_part = datetime.fromisoformat(timestamp_str).strftime(
-                            "%Y-%m-%d"
+                            "%Y-%m-%dT%H:%M:%S"
                         )
                     except (ValueError, TypeError):
                         date_part = timestamp_str.split("T")[0]
@@ -146,7 +146,7 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
             return "RECENT NEWS: No news data available."
         news_summaries = []
         for asset_id, articles in news_data.items():
-            display_name = market_data.get(asset_id, {}).get("question", asset_id)
+            display_name = asset_id
             if not articles:
                 news_summaries.append(f"• {display_name}: No recent news")
                 continue
@@ -177,7 +177,7 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
             recent_history = price_history[-20:]
             for i, h in enumerate(reversed(recent_history)):
                 hist_price = h.get("price", 0.0)
-                hist_date = h.get("date", "Unknown Date")
+                hist_date = h.get("timestamp", "Unknown Date")
                 price_str = (
                     f"close price ${hist_price:,.2f}"
                     if is_stock

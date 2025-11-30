@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import pytz
 
 from live_trade_bench.fetchers.stock_fetcher import StockFetcher
+from live_trade_bench.fetchers.binance_fetcher import BinanceFetcher
 
 from .config import (
     MARKET_HOURS,
@@ -786,3 +787,115 @@ def update_bitmex_prices_and_values() -> None:
 def update_realtime_prices_and_values() -> None:
     """Backward-compatible alias for stock price updates."""
     update_stock_prices_and_values()
+
+
+class BinancePriceUpdater:
+    """Price updater for Binance perpetuals using S3 parquet via BinanceFetcher."""
+
+    def __init__(self) -> None:
+        # Align with crypto initial cash; reuse bitmex initial cash as baseline
+        from .config import TRADING_CONFIG
+
+        self.initial_cash = TRADING_CONFIG.get("initial_cash_bitmex", 1000.0)
+        self.fetcher = BinanceFetcher()
+
+    def update_realtime_prices_and_values(self) -> None:
+        """Update Binance models' prices and computed values."""
+        try:
+            logger.info("🔄 Starting Binance price update...")
+            models_data = _load_models_data()
+            if not models_data:
+                logger.warning("⚠️ No models data found, skipping Binance update")
+                return
+
+            symbols = self._collect_binance_symbols(models_data)
+            if not symbols:
+                logger.info("ℹ️ No Binance symbols found in models data")
+                return
+
+            logger.info(f"📊 Updating Binance prices for {len(symbols)} symbols: {sorted(symbols)}")
+            price_cache = self._fetch_prices_batch(symbols)
+            if not price_cache:
+                logger.warning("⚠️ No Binance price data available, skipping update")
+                return
+
+            updated_count = 0
+            for model in models_data:
+                if model.get("category") != "binance":
+                    continue
+                if self._update_single_model(model, price_cache):
+                    updated_count += 1
+
+            _save_models_data(models_data)
+            logger.info(f"✅ Successfully updated {updated_count} Binance models")
+        except Exception as exc:
+            logger.error(f"❌ Failed to update Binance prices: {exc}")
+            raise
+
+    def _collect_binance_symbols(self, models_data: List[Dict]) -> List[str]:
+        symbols = set()
+        for model in models_data:
+            if model.get("category") != "binance":
+                continue
+            portfolio = model.get("portfolio", {})
+            positions = portfolio.get("positions", {}) or {}
+            symbols.update(positions.keys())
+        return list(symbols)
+
+    def _fetch_prices_batch(self, symbols: List[str]) -> Dict[str, float]:
+        price_cache: Dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                price = self.fetcher.get_price(symbol)
+                if price is not None and price > 0:
+                    price_cache[symbol] = float(price)
+                    logger.debug(f"✅ {symbol}: ${price:.4f}")
+                else:
+                    logger.warning(f"⚠️ Failed to get Binance price for {symbol}")
+            except Exception as exc:
+                logger.error(f"❌ Error fetching Binance price for {symbol}: {exc}")
+        return price_cache
+
+    def _update_single_model(self, model: Dict[str, Any], price_cache: Dict[str, float]) -> bool:
+        try:
+            portfolio = model.get("portfolio", {}) or {}
+            positions = portfolio.get("positions", {}) or {}
+            cash = float(portfolio.get("cash", 0.0))
+            total_value = cash
+
+            for symbol, position in positions.items():
+                price = price_cache.get(symbol)
+                if price is not None:
+                    position["current_price"] = price
+                else:
+                    price = float(position.get("current_price", 0.0))
+                quantity = float(position.get("quantity", 0.0))
+                total_value += quantity * price
+
+            portfolio["total_value"] = total_value
+
+            # Compute profit/performance based on initial cash baseline
+            model["profit"] = total_value - self.initial_cash
+            model["performance"] = (
+                (model["profit"] / self.initial_cash) * 100 if self.initial_cash else 0.0
+            )
+
+            _update_profit_history(model, total_value, model["profit"])
+            logger.debug(
+                f"Updated Binance model {model.get('name','Unknown')}: "
+                f"total_value=${total_value:.2f}, profit=${model['profit']:.2f}, "
+                f"performance={model['performance']:.4f}"
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to update Binance model {model.get('name','Unknown')}: {exc}")
+            return False
+
+
+# Global instance
+binance_price_updater = BinancePriceUpdater()
+
+
+def update_binance_prices_and_values() -> None:
+    """Update Binance perpetual contract prices (via S3 parquet)."""
+    binance_price_updater.update_realtime_prices_and_values()

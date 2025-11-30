@@ -32,10 +32,12 @@ Live Trade Bench is a comprehensive platform for evaluating LLM-based trading ag
 ## Installation
 
 ```bash
-# Install with pip
-pip install live-trade-bench
+# Option A: Install with uv (recommended)
+curl -LsSf https://astral.sh/uv/install.sh | sh  # if uv not installed
+uv venv
+uv pip install -e .
 
-# Or from source
+# Option B: Install from source with Poetry
 git clone https://github.com/ulab-uiuc/live-trade-bench.git
 cd live-trade-bench
 poetry install
@@ -52,6 +54,15 @@ export OPENAI_API_KEY="your-openai-key"
 # Optional: Set other LLM provider keys
 export ANTHROPIC_API_KEY="your-anthropic-key"
 export GOOGLE_API_KEY="your-google-key"
+
+# Required for Binance S3 (if used)
+export AWS_ACCESS_KEY_ID="your-aws-key"
+export AWS_SECRET_ACCESS_KEY="your-aws-secret"
+export AWS_DEFAULT_REGION="ap-southeast-1"
+
+# Optional overrides (defaults: horizonquant / collector)
+export BINANCE_S3_BUCKET="horizonquant"
+export BINANCE_S3_PREFIX="collector"
 ```
 
 ## Quick Start
@@ -143,6 +154,16 @@ for i in range(5):
     system.run_cycle()
 
 print("Demo finished.")
+```
+ 
+### Run Backend (uv)
+
+```bash
+# Standard multi-system API (stocks/polymarket/bitmex)
+uv run uvicorn backend/app/main.py:app --reload --port 8000
+
+# Binance-only testbed API
+uv run uvicorn backend/app/main_binance.py:app --reload --port 8001
 ```
 
 ### Example 2: Polymarket Trading System

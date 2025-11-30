@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from .base_fetcher import BaseFetcher
 from .bitmex_fetcher import BitMEXFetcher
+from .binance_fetcher import BinanceFetcher
 from .news_fetcher import NewsFetcher
 from .polymarket_fetcher import PolymarketFetcher, fetch_trending_markets
 
@@ -19,16 +20,16 @@ if TYPE_CHECKING:
     )
 else:
     # Runtime imports - try but degrade gracefully
-    try:
-        from .stock_fetcher import (
-            StockFetcher,
-            fetch_current_stock_price,
-            fetch_trending_stocks,
-        )
-    except Exception:
-        StockFetcher = None  # type: ignore
-        fetch_trending_stocks = None  # type: ignore
-        fetch_current_stock_price = None  # type: ignore
+    #try:
+    #    from .stock_fetcher import (
+    #        StockFetcher,
+    #        fetch_current_stock_price,
+    #        fetch_trending_stocks,
+    #    )
+    #except Exception:
+    #    StockFetcher = None  # type: ignore
+    #    fetch_trending_stocks = None  # type: ignore
+    #    fetch_current_stock_price = None  # type: ignore
 
     try:
         from .reddit_fetcher import RedditFetcher  # type: ignore
@@ -40,15 +41,16 @@ else:
 __all__ = [
     "BaseFetcher",
     "BitMEXFetcher",
+    "BinanceFetcher",
     "NewsFetcher",
     "PolymarketFetcher",
     "fetch_trending_markets",
 ]
 
-if StockFetcher is not None:
-    __all__.extend(
-        ["StockFetcher", "fetch_trending_stocks", "fetch_current_stock_price"]
-    )
+#if StockFetcher is not None:
+#    __all__.extend(
+#        ["StockFetcher", "fetch_trending_stocks", "fetch_current_stock_price"]
+#    )
 
 if RedditFetcher is not None:
     __all__.append("RedditFetcher")

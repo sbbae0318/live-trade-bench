@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Generic, List, Optional, TypeVar
+from ..utils.datetime_utils import parse_utc_datetime
 
 PositionType = TypeVar("PositionType")
 TransactionType = TypeVar("TransactionType")
@@ -68,9 +69,9 @@ class BaseAccount(ABC, Generic[PositionType, TransactionType]):
 
         if backtest_date:
             try:
-                backtest_datetime = datetime.strptime(backtest_date, "%Y-%m-%d")
-                timestamp = backtest_datetime.isoformat()
-            except ValueError:
+                dt = parse_utc_datetime(backtest_date)
+                timestamp = dt.isoformat()
+            except Exception:
                 timestamp = datetime.now().isoformat()
         else:
             timestamp = datetime.now().isoformat()
@@ -86,6 +87,7 @@ class BaseAccount(ABC, Generic[PositionType, TransactionType]):
             "llm_output": llm_output,
         }
         self.allocation_history.append(snapshot)
+        pass
 
     def get_total_value(self) -> float:
         return self.cash_balance + self.get_positions_value()

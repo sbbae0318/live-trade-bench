@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from bs4 import BeautifulSoup
 
 from live_trade_bench.fetchers.base_fetcher import BaseFetcher
+from live_trade_bench.utils.datetime_utils import parse_utc_datetime
 
 
 class NewsFetcher(BaseFetcher):
@@ -17,19 +18,18 @@ class NewsFetcher(BaseFetcher):
     def _normalize_date(
         self, s: str, fallback_now: Optional[datetime] = None
     ) -> tuple[str, datetime]:
+        """
+            Normalize various date/time strings to ("MM/DD/YYYY", datetime) for Google News queries.
+            Accepts dates with or without time; time component is ignored for the query but preserved in dt.
+        """
         if fallback_now is None:
             fallback_now = datetime.now()
-        s = s.strip()
-        if "-" in s:
-            dt = datetime.strptime(s, "%Y-%m-%d")
-            return dt.strftime("%m/%d/%Y"), dt
-        if "/" in s:
-            try:
-                dt = datetime.strptime(s, "%m/%d/%Y")
-                return s, dt
-            except ValueError:
-                pass
-        return fallback_now.strftime("%m/%d/%Y"), fallback_now
+        try:
+            dt = parse_utc_datetime(s)
+            # Google query expects only date granularity
+            return dt.strftime("%m/%d/%Y"), dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            return fallback_now.strftime("%m/%d/%Y"), fallback_now
 
     def _parse_relative_or_absolute(self, text: str, ref: datetime) -> float:
         t = text.strip().lower()
@@ -69,6 +69,35 @@ class NewsFetcher(BaseFetcher):
                 delta = timedelta(hours=num)
             elif unit == "dni":
                 delta = timedelta(days=num)
+            else:
+                delta = timedelta(0)
+            return (ref - delta).timestamp()
+
+        # Korean patterns: "9시간 전", "30분 전", "1일 전", "방금 전", "어제"
+        # Normalize unicode spaces and remove surrounding spaces
+        kt = re.sub(r"\s+", "", text)
+        # Specific words
+        if kt in ("방금전", "바로전"):
+            return (ref - timedelta(seconds=30)).timestamp()
+        if kt == "어제":
+            return (ref - timedelta(days=1)).timestamp()
+        m = re.match(r"^(\d+)(초|분|시간|일|주|개월?)전$", kt)
+        if m:
+            num = int(m.group(1))
+            unit = m.group(2)
+            if unit == "초":
+                delta = timedelta(seconds=num)
+            elif unit == "분":
+                delta = timedelta(minutes=num)
+            elif unit == "시간":
+                delta = timedelta(hours=num)
+            elif unit == "일":
+                delta = timedelta(days=num)
+            elif unit == "주":
+                delta = timedelta(weeks=num)
+            elif unit in ("개월", "달"):
+                # Approximate month as 30 days
+                delta = timedelta(days=30 * num)
             else:
                 delta = timedelta(0)
             return (ref - delta).timestamp()
@@ -252,7 +281,7 @@ def fetch_news_data(
     target_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     fetcher = NewsFetcher()
-    print(
+    logger.info(
         f"  - News fetcher with query '{query}' and start_date '{start_date}' and end_date '{end_date}'"
     )
     news_items = fetcher.fetch(query, start_date, end_date, max_pages)
@@ -265,7 +294,7 @@ def fetch_news_data(
 
     if target_date and valid_news:
         try:
-            target_ts = datetime.strptime(target_date, "%Y-%m-%d").timestamp()
+            target_ts = parse_utc_datetime(target_date).timestamp()
             sorted_news = sorted(valid_news, key=lambda x: abs(x["date"] - target_ts))
         except Exception:
             sorted_news = sorted(valid_news, key=lambda x: x["date"], reverse=True)

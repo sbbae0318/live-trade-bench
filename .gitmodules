@@ -1,0 +1,4 @@
+[submodule "external/hq-system"]
+	path = external/hq-system
+	url = git@github.com:HorizonQuant/System.git
+	branch = main

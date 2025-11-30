@@ -8,11 +8,16 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
+import asyncio
+ 
+from datetime import timezone
 
 from ..accounts import BitMEXAccount, create_bitmex_account
 from ..agents.bitmex_agent import LLMBitMEXAgent
 from ..fetchers.bitmex_fetcher import BitMEXFetcher
 from ..fetchers.news_fetcher import fetch_news_data
+from ..utils.datetime_utils import parse_utc_datetime
+import polars as pl
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +30,7 @@ class BitMEXPortfolioSystem:
     crypto perpetual contracts with 4x daily rebalancing.
     """
 
-    def __init__(self, universe_size: int = 15) -> None:
+    def __init__(self, universe_size: int = 15, name: str = "BitMEX") -> None:
         """
         Initialize BitMEX portfolio system.
 
@@ -39,13 +44,16 @@ class BitMEXPortfolioSystem:
         self.cycle_count = 0
         self.universe_size = universe_size
         self.fetcher = BitMEXFetcher()
+        self.name = name
+        # Keep the latest generated allocations for saving/analytics
+        self.last_allocations: Dict[str, Dict[str, float]] = {}
 
     def initialize_for_live(self) -> None:
         """Initialize for live trading by fetching trending contracts."""
         trending = self.fetcher.get_trending_contracts(limit=self.universe_size)
         symbols = [contract["symbol"] for contract in trending]
         self.set_universe(symbols)
-        logger.info(f"Initialized BitMEX system with {len(symbols)} contracts")
+        logger.info(f"Initialized {self.name} system with {len(symbols)} contracts")
 
     def initialize_for_backtest(self, trading_days: List[datetime]) -> None:
         """
@@ -106,11 +114,9 @@ class BitMEXPortfolioSystem:
         self.cycle_count += 1
         logger.info("Fetching data for BitMEX perpetual contracts...")
 
-        market_data = self._fetch_market_data(current_time_str if for_date else None)
-        if not market_data:
-            logger.warning("No market data for BitMEX, skipping cycle")
-            return
+        self._fetch_market_data(current_time_str if for_date else None)
 
+        market_data = self.market_data.filter(pl.col("symbol").is_in(self.universe))
         news_data = self._fetch_news_data(
             market_data, current_time_str if for_date else None
         )
@@ -118,6 +124,11 @@ class BitMEXPortfolioSystem:
             market_data, news_data, current_time_str
         )
         self._update_accounts(allocations, market_data, current_time_str)
+        # Keep the latest allocations for downstream saving/analytics
+
+        self.last_allocations = allocations
+        self.save_accounts_parquet(output_dir=self.name + "_result", for_date=current_time_str)
+        pass
 
     def _fetch_market_data(
         self, for_date: str | None = None
@@ -231,14 +242,16 @@ class BitMEXPortfolioSystem:
 
         try:
             if for_date:
-                ref = datetime.strptime(for_date, "%Y-%m-%d") - timedelta(days=1)
+                ref = parse_utc_datetime(for_date) - timedelta(days=1)
             else:
-                ref = datetime.utcnow()
+                ref = datetime.now(timezone.utc)
 
-            start_date = (ref - timedelta(days=3)).strftime("%Y-%m-%d")
-            end_date = ref.strftime("%Y-%m-%d")
+            start_dt = ref - timedelta(days=3)
+            # Include time component (UTC) in start/end strings
+            start_date = start_dt.strftime("%Y-%m-%d") #  %H:%M:%S UTC")
+            end_date = ref.strftime("%Y-%m-%d") # %H:%M:%S UTC")
 
-            for symbol in list(market_data.keys()):
+            for symbol in list(self.universe):
                 crypto_name = symbol_to_crypto.get(symbol, symbol)
                 query = f"{crypto_name} crypto news"
                 news_data_map[symbol] = fetch_news_data(
@@ -331,52 +344,91 @@ class BitMEXPortfolioSystem:
 
     def _generate_allocations(
         self,
-        market_data: Dict[str, Any],
+        market_data: Any,
         news_data: Dict[str, Any],
         for_date: str | None,
     ) -> Dict[str, Dict[str, float]]:
         """
-        Generate allocations for all agents.
-
+        Generate allocations for all agents concurrently using asyncio.gather.
+ 
         Args:
-            market_data: Market data dictionary
+            market_data: Market data (Polars DataFrame or dict)
             news_data: News data dictionary
             for_date: Optional date string
-
+ 
         Returns:
             Dictionary mapping agent name to allocation
         """
-        logger.info("Generating allocations for all agents...")
-        all_allocations = {}
-
-        for agent_name, agent in self.agents.items():
-            logger.info(f"Processing agent: {agent_name}")
-            account = self.accounts[agent_name]
-            account_data = account.get_account_data()
-
-            allocation = agent.generate_allocation(
-                market_data, account_data, for_date, news_data=news_data
-            )
-
-            if allocation:
-                all_allocations[agent_name] = allocation
-                logger.info(
-                    f"Allocation for {agent_name}: "
-                    f"{ {k: f'{v:.1%}' for k, v in list(allocation.items())[:5]} }"
+        logger.info("Generating allocations for all agents (async)...")
+ 
+        async def _gather_allocations_async() -> Dict[str, Dict[str, float]]:
+            tasks: list[asyncio.Future] = []
+            names: list[str] = []
+            accounts: list[BitMEXAccount] = []
+ 
+            for agent_name, agent in self.agents.items():
+                logger.info(f"Queueing agent for allocation: {agent_name}")
+                account = self.accounts[agent_name]
+                account_data = account.get_account_data()
+                # Run sync generate_allocation in a thread to allow concurrency
+                task = asyncio.to_thread(
+                    agent.generate_allocation, market_data, account_data, for_date, news_data
                 )
-            else:
-                logger.warning(
-                    f"No allocation generated for {agent_name}, keeping previous target"
-                )
-                all_allocations[agent_name] = account.target_allocations
-
-        logger.info("All allocations generated")
+                tasks.append(task)
+                names.append(agent_name)
+                accounts.append(account)
+ 
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            aggregated: Dict[str, Dict[str, float]] = {}
+            for name, acct, res in zip(names, accounts, results):
+                if isinstance(res, Exception):
+                    logger.error(f"Allocation failed for {name}: {res}")
+                    aggregated[name] = acct.target_allocations
+                    continue
+                allocation = res
+                if allocation:
+                    aggregated[name] = allocation
+                    logger.info(
+                        f"Allocation for {name}: "
+                        f"{ {k: f'{v:.1%}' for k, v in list(allocation.items())[:5]} }"
+                    )
+                else:
+                    logger.warning(
+                        f"No allocation generated for {name}, keeping previous target"
+                    )
+                    aggregated[name] = acct.target_allocations
+            return aggregated
+ 
+        # Run the async gather in a fresh event loop (we're in a sync context)
+        try:
+            all_allocations = asyncio.run(_gather_allocations_async())
+        except RuntimeError:
+            # If already in an event loop (unlikely here), fallback to sequential
+            logger.warning("Event loop already running; falling back to sequential allocation.")
+            all_allocations: Dict[str, Dict[str, float]] = {}
+            for agent_name, agent in self.agents.items():
+                logger.info(f"Processing agent (fallback): {agent_name}")
+                account = self.accounts[agent_name]
+                account_data = account.get_account_data()
+                try:
+                    allocation = agent.generate_allocation(
+                        market_data, account_data, for_date, news_data=news_data
+                    )
+                except Exception as e:
+                    logger.error(f"Allocation failed for {agent_name}: {e}")
+                    allocation = None
+                if allocation:
+                    all_allocations[agent_name] = allocation
+                else:
+                    all_allocations[agent_name] = account.target_allocations
+        else:
+            logger.info("All allocations generated")
         return all_allocations
 
     def _update_accounts(
         self,
         allocations: Dict[str, Dict[str, float]],
-        market_data: Dict[str, Any],
+        market_data: Any,
         for_date: str | None = None,
     ) -> None:
         """
@@ -388,7 +440,56 @@ class BitMEXPortfolioSystem:
             for_date: Optional date string
         """
         logger.info("Updating all accounts...")
-        price_map = {s: d.get("current_price") for s, d in market_data.items()}
+        # Build price map supporting both dict and Polars DataFrame market_data
+        price_map: Dict[str, float] = {}
+        metadata_map: Dict[str, Dict[str, Any]] | None = None
+        try:
+            import polars as pl  # type: ignore
+            if isinstance(market_data, pl.DataFrame):
+                df = market_data
+                if "symbol" in df.columns:
+                    # Determine best available price column
+                    candidate_cols = [
+                        c for c in [
+                            "current_price",
+                            "trdp_last_15m",
+                            "vwap_15m",
+                            "mark_price_15m",
+                            "bam_close_15m",
+                            "index_price_15m",
+                            "settle_price_15m",
+                        ] if c in df.columns
+                    ]
+                    if candidate_cols:
+                        price_expr = pl.coalesce([pl.col(c) for c in candidate_cols]).alias("price")
+                        if "close_time" in df.columns:
+                            latest = df.group_by("symbol").agg(pl.col("close_time").max().alias("max_ct"))
+                            df_latest = (
+                                df.join(latest, on="symbol", how="inner")
+                                .filter(pl.col("close_time") == pl.col("max_ct"))
+                                .select([pl.col("symbol"), price_expr])
+                            )
+                        else:
+                            df_latest = df.select([pl.col("symbol"), price_expr]).unique(subset=["symbol"], keep="last")
+                        for sym, px in df_latest.iter_rows():
+                            try:
+                                if px is not None:
+                                    price_map[str(sym)] = float(px)
+                            except Exception:
+                                continue
+                metadata_map = {}  # No dict-style metadata when using DataFrame
+            elif isinstance(market_data, dict):
+                price_map = {s: d.get("current_price") for s, d in market_data.items()}
+                metadata_map = market_data
+            else:
+                metadata_map = {}
+        except Exception:
+            # Fallback: try dict path
+            if isinstance(market_data, dict):
+                price_map = {s: d.get("current_price") for s, d in market_data.items()}
+                metadata_map = market_data
+            else:
+                metadata_map = {}
 
         for agent_name, allocation in allocations.items():
             account = self.accounts[agent_name]
@@ -396,7 +497,7 @@ class BitMEXPortfolioSystem:
 
             try:
                 account.apply_allocation(
-                    allocation, price_map=price_map, metadata_map=market_data
+                    allocation, price_map=price_map, metadata_map=metadata_map
                 )
 
                 # Capture LLM input/output for audit trail
@@ -408,7 +509,7 @@ class BitMEXPortfolioSystem:
                     llm_output = getattr(agent, "last_llm_output", None)
 
                 account.record_allocation(
-                    metadata_map=market_data,
+                    metadata_map=metadata_map,
                     backtest_date=for_date,
                     llm_input=llm_input,
                     llm_output=llm_output,
@@ -430,6 +531,66 @@ class BitMEXPortfolioSystem:
         if not hasattr(cls, "_instance"):
             cls._instance = create_bitmex_portfolio_system()
         return cls._instance
+
+    # -------------------------
+    # Allocation export helpers
+    # -------------------------
+    def allocations_to_dataframe(self, for_date: str | None = None) -> pl.DataFrame:
+        """
+        Convert the latest allocations into a Polars DataFrame.
+        Columns: ['timestamp', 'close_time', 'cycle', 'agent', 'symbol', 'weight']
+        """
+        if not self.last_allocations:
+            return pl.DataFrame(
+                {
+                    "timestamp": [],
+                    "close_time": [],
+                    "cycle": [],
+                    "agent": [],
+                    "symbol": [],
+                    "weight": [],
+                }
+            )
+
+        # Build UTC datetime for timestamp; handle multiple input formats if for_date is provided
+        now_utc = datetime.now(timezone.utc)
+        if for_date:
+            parsed = None
+            for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H%M%S"):
+                try:
+                    parsed = datetime.strptime(for_date, fmt)
+                    break
+                except Exception:
+                    continue
+            if parsed is None:
+                # Fallback: keep current time if parsing fails
+                ts_dt = now_utc
+            else:
+                # Assume UTC; if naive, attach UTC
+                if parsed.tzinfo is None:
+                    ts_dt = parsed.replace(tzinfo=timezone.utc)
+                else:
+                    ts_dt = parsed.astimezone(timezone.utc)
+        else:
+            ts_dt = now_utc
+
+        rows: List[Dict[str, Any]] = []
+        for agent_name, allocation in self.last_allocations.items():
+            for symbol, weight in allocation.items():
+                rows.append(
+                    {
+                        # datetime object (UTC)
+                        "timestamp": ts_dt,
+                        # epoch milliseconds (int)
+                        "close_time": int(ts_dt.timestamp() * 1000),
+                        "cycle": self.cycle_count,
+                        "agent": agent_name,
+                        "symbol": "USDT" if symbol == "CASH" else symbol,
+                        "weight": float(weight),
+                    }
+                )
+        
+        return pl.DataFrame(rows, strict=False)
 
 
 def create_bitmex_portfolio_system() -> BitMEXPortfolioSystem:
