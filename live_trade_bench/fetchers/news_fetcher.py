@@ -9,6 +9,8 @@ from bs4 import BeautifulSoup
 
 from live_trade_bench.fetchers.base_fetcher import BaseFetcher
 from live_trade_bench.utils.datetime_utils import parse_utc_datetime
+# Simple in-memory cache: key = f"{query}|{start_date}|{end_date}" -> sorted news list
+_NEWS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 
 
 class NewsFetcher(BaseFetcher):
@@ -20,14 +22,16 @@ class NewsFetcher(BaseFetcher):
     ) -> tuple[str, datetime]:
         """
             Normalize various date/time strings to ("MM/DD/YYYY", datetime) for Google News queries.
-            Accepts dates with or without time; time component is ignored for the query but preserved in dt.
+            Google News only supports date-level granularity, but we preserve the full datetime
+            for post-filtering by time if needed.
         """
         if fallback_now is None:
             fallback_now = datetime.now()
         try:
             dt = parse_utc_datetime(s)
-            # Google query expects only date granularity
-            return dt.strftime("%m/%d/%Y"), dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Google News URL parameter only accepts date format (MM/DD/YYYY)
+            # Time component is preserved in dt for post-filtering
+            return dt.strftime("%m/%d/%Y"), dt
         except Exception:
             return fallback_now.strftime("%m/%d/%Y"), fallback_now
 
@@ -185,8 +189,15 @@ class NewsFetcher(BaseFetcher):
     def fetch(
         self, query: str, start_date: str, end_date: str, max_pages: int = 10
     ) -> List[Dict[str, Any]]:
-        start_fmt, _ = self._normalize_date(start_date)
-        end_fmt, ref_date = self._normalize_date(end_date)
+        start_fmt, start_dt = self._normalize_date(start_date)
+        end_fmt, end_dt = self._normalize_date(end_date)
+        ref_date = end_dt  # Use end_date as reference for relative time parsing
+        
+        # Check if time component is specified (not 00:00:00)
+        has_time_filter = (
+            start_dt.hour != 0 or start_dt.minute != 0 or start_dt.second != 0 or
+            end_dt.hour != 0 or end_dt.minute != 0 or end_dt.second != 0
+        )
 
         # Use HTML-specific headers for Google News scraping
         html_headers = {
@@ -202,71 +213,98 @@ class NewsFetcher(BaseFetcher):
             "Upgrade-Insecure-Requests": "1",
         }
 
+        # Maximum pages to fetch if filtering results in empty results
+        max_total_pages = 20  # Limit to prevent infinite fetching
+        
         results: List[Dict[str, Any]] = []
-        for page in range(max_pages):
-            # URL-encode the query to handle spaces and special characters
-            encoded_query = quote_plus(query)
-            url = (
-                f"https://www.google.com/search?q={encoded_query}"
-                f"&tbs=cdr:1,cd_min:{start_fmt},cd_max:{end_fmt}"
-                f"&tbm=nws&start={page * 10}"
-            )
-            try:
-                resp = self.make_request(url, headers=html_headers, timeout=15)
-                # Use resp.text instead of resp.content to handle gzip encoding properly
-                soup = BeautifulSoup(resp.text, "html.parser")
-            except Exception as e:
-                print(f"Request/parse failed: {e}")
-                break
-
-            cards = soup.select("div.SoaBEf")
-            if not cards:
-                break
-
-            for el in cards:
+        current_max_pages = max_pages
+        
+        while len(results) == 0 and current_max_pages <= max_total_pages:
+            # Fetch pages
+            for page in range(current_max_pages):
+                # URL-encode the query to handle spaces and special characters
+                encoded_query = quote_plus(query)
+                url = (
+                    f"https://www.google.com/search?q={encoded_query}"
+                    f"&tbs=cdr:1,cd_min:{start_fmt},cd_max:{end_fmt}"
+                    f"&tbm=nws&start={page * 10}"
+                )
                 try:
-                    a = el.find("a")
-                    if not a or "href" not in a.attrs:
-                        continue
-                    link = self._clean_google_href(a["href"])
-
-                    title_el = el.select_one("div.MBeuO")
-                    date_el = el.select_one(".LfVVr")
-                    source_el = el.select_one(".NUnG9d span")
-
-                    # Snippet is optional - title, date, and source are required
-                    if not (title_el and date_el and source_el):
-                        continue
-
-                    # Get snippet with dynamic fallback strategy
-                    snippet = self._find_snippet_dynamically(
-                        el,
-                        title_el.get_text(strip=True),
-                        source_el.get_text(strip=True),
-                        date_el.get_text(strip=True),
-                    )
-
-                    if not snippet and link and page == 0:
-                        snippet = self._extract_snippet_from_url(link)
-
-                    ts = self._parse_relative_or_absolute(
-                        date_el.get_text(strip=True), ref_date
-                    )
-
-                    results.append(
-                        {
-                            "link": link,
-                            "title": title_el.get_text(strip=True),
-                            "snippet": snippet,
-                            "date": ts,
-                            "source": source_el.get_text(strip=True),
-                        }
-                    )
+                    resp = self.make_request(url, headers=html_headers, timeout=15)
+                    # Use resp.text instead of resp.content to handle gzip encoding properly
+                    soup = BeautifulSoup(resp.text, "html.parser")
                 except Exception as e:
-                    print(f"Error processing result: {e}")
-                    continue
+                    print(f"Request/parse failed: {e}")
+                    break
 
-            if not soup.find("a", id="pnnext"):
+                cards = soup.select("div.SoaBEf")
+                if not cards:
+                    break
+
+                for el in cards:
+                    try:
+                        a = el.find("a")
+                        if not a or "href" not in a.attrs:
+                            continue
+                        link = self._clean_google_href(a["href"])
+
+                        title_el = el.select_one("div.MBeuO")
+                        date_el = el.select_one(".LfVVr")
+                        source_el = el.select_one(".NUnG9d span")
+
+                        # Snippet is optional - title, date, and source are required
+                        if not (title_el and date_el and source_el):
+                            continue
+
+                        # Get snippet with dynamic fallback strategy
+                        snippet = self._find_snippet_dynamically(
+                            el,
+                            title_el.get_text(strip=True),
+                            source_el.get_text(strip=True),
+                            date_el.get_text(strip=True),
+                        )
+
+                        if not snippet and link and page == 0:
+                            snippet = self._extract_snippet_from_url(link)
+
+                        ts = self._parse_relative_or_absolute(
+                            date_el.get_text(strip=True), ref_date
+                        )
+
+                        # Filter by time range if start_date or end_date have time components
+                        # Google News only supports date-level filtering, so we filter client-side by timestamp
+                        if has_time_filter:
+                            article_ts = ts
+                            start_ts = start_dt.timestamp()
+                            end_ts = end_dt.timestamp()
+                            
+                            if article_ts < start_ts or article_ts > end_ts:
+                                continue
+
+                        results.append(
+                            {
+                                "link": link,
+                                "title": title_el.get_text(strip=True),
+                                "snippet": snippet,
+                                "date": ts,
+                                "source": source_el.get_text(strip=True),
+                            }
+                        )
+                    except Exception as e:
+                        print(f"Error processing result: {e}")
+                        continue
+
+                if not soup.find("a", id="pnnext"):
+                    break
+            
+            # If time filtering is active and no results after filtering, fetch more pages
+            if has_time_filter and len(results) == 0 and current_max_pages < max_total_pages:
+                # Increase pages for next iteration
+                current_max_pages = min(current_max_pages + 5, max_total_pages)
+                # Reset results to try again with more pages
+                results = []
+            else:
+                # Either no time filter, or we have results, or reached max pages
                 break
 
         return results
@@ -281,24 +319,30 @@ def fetch_news_data(
     target_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     fetcher = NewsFetcher()
-    logger.info(
+    print(
         f"  - News fetcher with query '{query}' and start_date '{start_date}' and end_date '{end_date}'"
     )
-    news_items = fetcher.fetch(query, start_date, end_date, max_pages)
+
+    cache_key = f"{query}|{start_date}|{end_date}"
+
+    if cache_key in _NEWS_CACHE:
+        sorted_news = _NEWS_CACHE[cache_key]
+    else:
+        news_items = fetcher.fetch(query, start_date, end_date, max_pages)
+        valid_news = [it for it in news_items if it.get("date") is not None]
+
+        if target_date and valid_news:
+            try:
+                target_ts = parse_utc_datetime(target_date).timestamp()
+                sorted_news = sorted(valid_news, key=lambda x: abs(x["date"] - target_ts))
+            except Exception:
+                sorted_news = sorted(valid_news, key=lambda x: x["date"], reverse=True)
+        else:
+            sorted_news = sorted(valid_news, key=lambda x: x["date"], reverse=True)
+
+        _NEWS_CACHE[cache_key] = sorted_news
 
     if ticker:
-        for it in news_items:
-            it["tag"] = ticker
-
-    valid_news = [it for it in news_items if it.get("date") is not None]
-
-    if target_date and valid_news:
-        try:
-            target_ts = parse_utc_datetime(target_date).timestamp()
-            sorted_news = sorted(valid_news, key=lambda x: abs(x["date"] - target_ts))
-        except Exception:
-            sorted_news = sorted(valid_news, key=lambda x: x["date"], reverse=True)
-    else:
-        sorted_news = sorted(valid_news, key=lambda x: x["date"], reverse=True)
-
+        # Do not mutate cached entries; add tag on a shallow-copied list
+        return [{**it, "tag": ticker} for it in sorted_news]
     return sorted_news

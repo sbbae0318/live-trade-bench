@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
-
+import time
 
 def _resolve_provider_and_model(model: str) -> Tuple[Optional[str], str, Optional[str]]:
     raw = model.strip()
@@ -55,9 +55,10 @@ def call_llm(
         if api_key_env and os.getenv(api_key_env):
             completion_params["api_key"] = os.getenv(api_key_env)
 
+        start_time = time.perf_counter()
         response = litellm.completion(**completion_params)
         content = response.choices[0].message.content
-        print(f"✅ LLM ({agent_name}) call successful")
+        print(f"✅ LLM ({agent_name}) call successful in {time.perf_counter() - start_time:.2f}s")
         return {"success": True, "content": content}
 
     except Exception as e:

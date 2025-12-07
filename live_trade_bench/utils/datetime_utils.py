@@ -24,18 +24,21 @@ def parse_utc_datetime(s: Optional[str]) -> datetime:
         text = text[:-4].strip()
     if text.endswith("Z"):
         text = text[:-1]
-    # Try explicit known formats
+    # Try explicit known formats (try date-only format first to avoid partial matches)
     candidates = [
+        "%Y-%m-%d",  # Date only - try first to avoid partial match issues
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H%M%S",
     ]
     for fmt in candidates:
         try:
             dt = datetime.strptime(text, fmt)
+            # If date-only format, set time to 00:00:00
+            if fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
             return dt.replace(tzinfo=timezone.utc)
-        except Exception:
+        except ValueError:
             continue
     # Fallback: fromisoformat after replacing 'T' with space for flexibility
     try:

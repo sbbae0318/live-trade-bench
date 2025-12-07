@@ -9,6 +9,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 import asyncio
+import time
  
 from datetime import timezone
 
@@ -16,10 +17,32 @@ from ..accounts import BitMEXAccount, create_bitmex_account
 from ..agents.bitmex_agent import LLMBitMEXAgent
 from ..fetchers.bitmex_fetcher import BitMEXFetcher
 from ..fetchers.news_fetcher import fetch_news_data
-from ..utils.datetime_utils import parse_utc_datetime
 import polars as pl
+from ..utils.datetime_utils import parse_utc_datetime
 
 logger = logging.getLogger(__name__)
+
+
+class StepProfiler:
+    def __init__(self) -> None:
+        self.records: List[Dict[str, Any]] = []
+
+    def add(self, name: str, seconds: float) -> None:
+        # Accumulate seconds if the step already exists
+        for r in self.records:
+            if r.get("name") == name:
+                r["seconds"] = float(r.get("seconds", 0.0)) + float(seconds)
+                return
+        self.records.append({"name": name, "seconds": float(seconds)})
+
+    def print_profile(self, logger: logging.Logger, total_seconds: float | None = None) -> None:
+        total = total_seconds if total_seconds is not None else sum(r["seconds"] for r in self.records)
+        logger.info("=== Profile Report ===")
+        logger.info(f"Total elapsed: {total:.2f}s")
+        for r in self.records:
+            share = (r["seconds"] / total * 100.0) if total > 0 else 0.0
+            logger.info(f"- {r['name']}: {r['seconds']:.2f}s ({share:.1f}%)")
+        logger.info("======================")
 
 
 class BitMEXPortfolioSystem:
@@ -47,6 +70,7 @@ class BitMEXPortfolioSystem:
         self.name = name
         # Keep the latest generated allocations for saving/analytics
         self.last_allocations: Dict[str, Dict[str, float]] = {}
+        self.profiler = StepProfiler()
 
     def initialize_for_live(self) -> None:
         """Initialize for live trading by fetching trending contracts."""
@@ -103,6 +127,9 @@ class BitMEXPortfolioSystem:
         Args:
             for_date: Optional date for backtesting (YYYY-MM-DD format)
         """
+
+        profiler = self.profiler
+        total_start = time.perf_counter()
         logger.info(f"Cycle {self.cycle_count + 1} started for BitMEX System")
         if for_date:
             logger.info(f"Backtest mode - Date: {for_date}")
@@ -114,99 +141,28 @@ class BitMEXPortfolioSystem:
         self.cycle_count += 1
         logger.info("Fetching data for BitMEX perpetual contracts...")
 
+        t0 = time.perf_counter()
         self._fetch_market_data(current_time_str if for_date else None)
-
         market_data = self.market_data.filter(pl.col("symbol").is_in(self.universe))
-        news_data = self._fetch_news_data(
-            market_data, current_time_str if for_date else None
-        )
-        allocations = self._generate_allocations(
-            market_data, news_data, current_time_str
-        )
+        profiler.add("fetch_market_data", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        news_data = self._fetch_news_data(market_data, current_time_str if for_date else None)
+        profiler.add("fetch_news_data", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        allocations = self._generate_allocations(market_data, news_data, current_time_str)
+        profiler.add("generate_allocations", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
         self._update_accounts(allocations, market_data, current_time_str)
-        # Keep the latest allocations for downstream saving/analytics
+        profiler.add("update_accounts", time.perf_counter() - t0)
 
         self.last_allocations = allocations
-        self.save_accounts_parquet(output_dir=self.name + "_result", for_date=current_time_str)
+        t0 = time.perf_counter()
+        self.save_accounts_parquet(for_date=current_time_str)
+        profiler.add("save_accounts_parquet", time.perf_counter() - t0)
         pass
-
-    def _fetch_market_data(
-        self, for_date: str | None = None
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Fetch comprehensive market data for all contracts.
-
-        Includes:
-        - Current prices and history
-        - Funding rates
-        - Order book depth
-        - Open interest (from trending data)
-
-        Args:
-            for_date: Optional date for backtesting
-
-        Returns:
-            Dictionary mapping symbol to market data
-        """
-        logger.info("Fetching BitMEX market data...")
-        market_data = {}
-
-        for symbol in self.universe:
-            try:
-                # Get price with history (pass for_date for backtesting)
-                price_data = self.fetcher.get_price_with_history(
-                    symbol, lookback_days=10, price_type="mark", date=for_date
-                )
-
-                # Get funding rate
-                try:
-                    funding_data = self.fetcher.get_funding_rate(symbol)
-                    funding_rate = funding_data.get("funding_rate") or 0.0
-                except Exception:
-                    funding_rate = 0.0
-
-                # Get order book depth
-                try:
-                    orderbook = self.fetcher.get_orderbook(symbol, depth=10)
-                    bids = orderbook.get("bids", [])
-                    asks = orderbook.get("asks", [])
-                    bid_depth = sum(b["size"] * b["price"] for b in bids[:10]) if bids else 0
-                    ask_depth = sum(a["size"] * a["price"] for a in asks[:10]) if asks else 0
-                except Exception:
-                    bid_depth = 0
-                    ask_depth = 0
-
-                current_price = price_data.get("current_price")
-                price_history = price_data.get("price_history", [])
-
-                if current_price:
-                    url = f"https://www.bitmex.com/app/trade/{symbol}"
-                    market_data[symbol] = {
-                        "symbol": symbol,
-                        "name": symbol,
-                        "current_price": current_price,
-                        "price_history": price_history,
-                        "funding_rate": funding_rate,
-                        "bid_depth": bid_depth,
-                        "ask_depth": ask_depth,
-                        "open_interest": None,  # Could be added from trending data
-                        "url": url,
-                    }
-
-                    # Update position prices in all accounts
-                    for account in self.accounts.values():
-                        account.update_position_price(symbol, current_price)
-
-            except Exception as e:
-                logger.error(f"Failed to fetch data for {symbol}: {e}")
-                logger.debug(f"Full traceback for {symbol}:\n{traceback.format_exc()}")
-
-        logger.info(f"Market data fetched for {len(market_data)} contracts")
-        for symbol, data in list(market_data.items())[:3]:
-            funding = (data.get("funding_rate") or 0) * 100
-            logger.info(f"{symbol}: ${data['current_price']:,.2f} (funding: {funding:.4f}%)")
-
-        return market_data
 
     def _fetch_news_data(
         self, market_data: Dict[str, Any], for_date: str | None

@@ -56,9 +56,9 @@ class BaseAgent(ABC, Generic[AccountType, DataType]):
                 "timestamp": datetime.now().isoformat(),
             }
 
-            #print("\n--- LLM PROMPT ---")
-            #print(messages[0]["content"])
-            #print("--- END LLM PROMPT ---\n")
+            print("\n--- LLM PROMPT ---")
+            print(messages[0]["content"])
+            print("--- END LLM PROMPT ---\n")
 
             llm_response = self._call_llm(messages)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +12,7 @@ from ..accounts import BitMEXAccount, create_bitmex_account
 from ..agents.bitmex_agent import LLMBitMEXAgent
 from ..fetchers.binance_fetcher import BinanceFetcher
 from ..utils.datetime_utils import parse_utc_datetime
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class BinancePortfolioSystem(BitMEXPortfolioSystem):
@@ -33,6 +31,7 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
         self.fetcher = BinanceFetcher()
         self.market_data: pl.DataFrame = pl.DataFrame()
         self.lookback_days = 10
+        self.output_dir = Path(os.getenv("BASE_DIR")) / name
 
     def add_agent(
         self, name: str, initial_cash: float = 10000.0, model_name: str = "gpt-4o-mini"
@@ -55,27 +54,58 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
         dt = self.fetcher._resolve_target_datetime(for_date) if for_date else None
         if dt is None:
             dt = datetime.now(timezone.utc)
-        agg_trades_df = self.fetcher.get_agg_trades(symbol_list=self.universe, dt=dt, count= 4 * 24 * (self.lookback_days + 1))
-        funding_rate_df = self.fetcher.get_funding_rate_df(symbol_list=self.universe, dt=dt, count= 4 * 24 * (self.lookback_days + 1))
-        ob_df = self.fetcher.get_orderbook_df(symbol_list=self.universe, dt=dt, count= 4 * 24 * (self.lookback_days + 1))
+
+        agg_trades_df = self.fetcher.get_agg_trades(symbol_list=self.universe, dt=dt, lookback_days=self.lookback_days)
+
+        funding_rate_df = self.fetcher.get_funding_rate_df(symbol_list=self.universe, dt=dt, lookback_days=self.lookback_days)
+        ob_df = self.fetcher.get_orderbook_df(symbol_list=self.universe, dt=dt, lookback_days=self.lookback_days)
 
         # Inner join on ['symbol', 'close_time'] across agg_trades, funding_rate, orderbook
+        # Constraint: (symbol, close_time) pairs must be unique in each DataFrame
         try:
-            agg_trades_df = agg_trades_df.drop(["start_time", "end_time", "count"])
-            funding_rate_df = funding_rate_df.drop(["start_time", "end_time", "count"])
-            ob_df = ob_df.drop(["start_time", "end_time", "count"])
+            # Drop columns only if they exist
+            cols_to_drop = ["start_time", "end_time", "count"]
+            agg_trades_df = agg_trades_df.drop([col for col in cols_to_drop if col in agg_trades_df.columns])
+            funding_rate_df = funding_rate_df.drop([col for col in cols_to_drop if col in funding_rate_df.columns])
+            ob_df = ob_df.drop([col for col in cols_to_drop if col in ob_df.columns])
+
+            # Validate uniqueness constraint: (symbol, close_time) must be unique
+            def check_uniqueness(df: pl.DataFrame, name: str) -> None:
+                duplicates = df.group_by(["symbol", "close_time"]).agg(pl.count().alias("count")).filter(pl.col("count") > 1)
+                if not duplicates.is_empty():
+                    error_msg = f"Violation: (symbol, close_time) must be unique in {name}. Found duplicates:\n{duplicates}"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+
+            check_uniqueness(agg_trades_df, "agg_trades_df")
+            check_uniqueness(funding_rate_df, "funding_rate_df")
+            check_uniqueness(ob_df, "ob_df")
 
             joined = agg_trades_df.join(funding_rate_df, on=["symbol", "close_time"], how="inner")
             joined = joined.join(ob_df, on=["symbol", "close_time"], how="inner")
+            
+            # Validate uniqueness after join (join should preserve uniqueness)
+            check_uniqueness(joined, "joined")
+            
             self.market_data = joined
         except Exception as e:
             logger.error(f"Failed to join market data frames: {e}")
             # Fallback to empty DataFrame to avoid stale state
             self.market_data = pl.DataFrame()
+            raise
 
+        # Update position prices: since (symbol, close_time) is unique, we can safely get latest price
         for symbol in self.universe:
             try:
-                current_price = joined.filter(joined["symbol"] == symbol).filter(pl.col("close_time") == pl.max("close_time")).select("bam_close_15m").to_series().item()
+                symbol_df = joined.filter(joined["symbol"] == symbol)
+                if symbol_df.is_empty():
+                    continue
+                # Get the row with maximum close_time (unique constraint ensures single row)
+                max_close_time = symbol_df["close_time"].max()
+                latest_row = symbol_df.filter(pl.col("close_time") == max_close_time)
+                if latest_row.is_empty():
+                    continue
+                current_price = latest_row.select("bam_close_15m").to_series().item()
                 # Update position prices in all accounts
                 for account in self.accounts.values():
                     account.update_position_price(symbol, float(current_price))
@@ -137,7 +167,6 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
 
     def save_accounts_parquet(
         self,
-        output_dir: str | Path,
         for_date: str | None = None,
     ) -> Path:
         """
@@ -189,7 +218,7 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
 
         df = pl.DataFrame(rows, strict=False) if rows else pl.DataFrame()
 
-        output_dir_path = Path(output_dir)
+        output_dir_path = self.output_dir
         output_dir_path.mkdir(parents=True, exist_ok=True)
 
         now_utc = datetime.now(timezone.utc)
@@ -232,7 +261,7 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
 
         # Append per-agent summary (cash_balance, total_value, performance) as CSV in output_dir_path
         try:
-            csv_path = output_dir_path / f"{self.name}_account_summary.csv"
+            csv_path = output_dir_path / "account_summary.csv"
             need_header = not os.path.exists(csv_path)
             with open(csv_path, "a", newline="", encoding="utf-8") as fcsv:
                 fieldnames = ["timestamp", "close_time", "agent", "cash_balance", "total_value", "performance"]

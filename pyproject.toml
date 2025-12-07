@@ -33,6 +33,7 @@ dependencies = [
   "debugpy>=1.8.17",
   "typing-extensions>=4.15.0",
   "aioboto3>=15.5.0",
+  "loguru>=0.7.3",
 ]
 
 [project.optional-dependencies]
