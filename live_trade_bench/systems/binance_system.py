@@ -81,7 +81,63 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
             check_uniqueness(funding_rate_df, "funding_rate_df")
             check_uniqueness(ob_df, "ob_df")
 
+            # Sanity check: Remove duplicate columns before join
+            def remove_duplicate_columns(df: pl.DataFrame, existing_df: pl.DataFrame, name: str) -> pl.DataFrame:
+                """Remove columns from df that already exist in existing_df (except join keys)"""
+                existing_cols = set(existing_df.columns)
+                join_keys = ["symbol", "close_time"]
+                cols_to_remove = []
+                
+                for col in df.columns:
+                    # Skip join keys
+                    if col in join_keys:
+                        continue
+                    # Check if column exists in existing_df
+                    if col in existing_cols:
+                        cols_to_remove.append(col)
+                        logger.warning(f"Removing duplicate column '{col}' from {name} before join")
+                
+                if cols_to_remove:
+                    df = df.drop(cols_to_remove)
+                
+                return df
+
             joined = agg_trades_df.join(funding_rate_df, on=["symbol", "close_time"], how="inner")
+            
+            # Before second join, check for potential column conflicts
+            # 1. Remove columns from ob_df that already exist in joined (except join keys)
+            ob_df = remove_duplicate_columns(ob_df, joined, "ob_df")
+            
+            # 2. Check for columns with _right suffix that might conflict
+            # If joined already has columns ending with _right, ob_df columns with same base name
+            # would try to get _right suffix again, causing DuplicateError
+            joined_right_cols = [col for col in joined.columns if col.endswith("_right")]
+            if joined_right_cols:
+                logger.debug(f"Found columns with '_right' suffix in joined: {joined_right_cols}")
+                # Remove base columns from ob_df that would conflict
+                ob_df_cols_to_remove = []
+                for right_col in joined_right_cols:
+                    base_col = right_col.replace("_right", "")
+                    if base_col in ob_df.columns:
+                        ob_df_cols_to_remove.append(base_col)
+                        logger.warning(f"Removing '{base_col}' from ob_df to avoid conflict with existing '{right_col}' in joined")
+                if ob_df_cols_to_remove:
+                    ob_df = ob_df.drop(ob_df_cols_to_remove)
+            
+            # 3. Also check if ob_df has columns that would create _right suffix conflicts
+            # If ob_df has a column that would become 'X_right' but 'X_right' already exists in joined
+            joined_cols_set = set(joined.columns)
+            ob_df_cols_to_remove_conflict = []
+            for ob_col in ob_df.columns:
+                if ob_col in ["symbol", "close_time"]:
+                    continue
+                potential_right_col = f"{ob_col}_right"
+                if potential_right_col in joined_cols_set:
+                    ob_df_cols_to_remove_conflict.append(ob_col)
+                    logger.warning(f"Removing '{ob_col}' from ob_df to avoid creating duplicate '{potential_right_col}'")
+            if ob_df_cols_to_remove_conflict:
+                ob_df = ob_df.drop(ob_df_cols_to_remove_conflict)
+            
             joined = joined.join(ob_df, on=["symbol", "close_time"], how="inner")
             
             # Validate uniqueness after join (join should preserve uniqueness)
@@ -235,13 +291,122 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
         date_dir = dstr.split("T")[0] if "T" in dstr else dstr[:10]
         dated_dir_path = output_dir_path / date_dir
         dated_dir_path.mkdir(parents=True, exist_ok=True)
-        file_path = dated_dir_path / f"{self.name}_{dstr}.parquet"
+        file_path = dated_dir_path / f"{dstr}.parquet"
 
         df.write_parquet(str(file_path))
         logger.info(f"Saved allocations to {file_path}")
 
+        # Save additional account metadata as JSON for state restoration
+        metadata_path = dated_dir_path / f"{dstr}_metadata.json"
+        try:
+            metadata = {
+                "timestamp": ts_dt.isoformat(),
+                "close_time": close_time_ms,
+                "agents": {}
+            }
+            for agent_name, account in self.accounts.items():
+                metadata["agents"][agent_name] = {
+                    "cash_balance": float(account.cash_balance),
+                    "total_value": float(account.get_total_value()),
+                    "initial_cash": float(getattr(account, "initial_cash", 0.0)),
+                    "target_allocations": {k: float(v) for k, v in account.target_allocations.items()},
+                    "total_fees": float(getattr(account, "total_fees", 0.0)),
+                    "total_funding_fees": float(getattr(account, "total_funding_fees", 0.0)),
+                    "last_rebalance": account.last_rebalance,
+                }
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            logger.info(f"Saved account metadata to {metadata_path}")
+        except Exception as e:
+            logger.error(f"Failed to write account metadata: {e}")
+
+        # Save allocation_history for each agent (append mode to preserve full history)
+        # Store in a single file per agent to accumulate history across all trades
+        for agent_name, account in self.accounts.items():
+            allocation_history_path = self.output_dir / f"{agent_name}_allocation_history.json"
+            try:
+                # Load existing history if file exists
+                existing_history = []
+                if allocation_history_path.exists():
+                    try:
+                        with open(allocation_history_path, "r", encoding="utf-8") as f:
+                            existing_data = json.load(f)
+                            existing_history = existing_data.get("history", [])
+                    except Exception:
+                        existing_history = []
+                
+                # Merge with current history (avoid duplicates based on timestamp)
+                existing_timestamps = {entry.get("timestamp") for entry in existing_history}
+                new_entries = [
+                    entry for entry in account.allocation_history
+                    if entry.get("timestamp") not in existing_timestamps
+                ]
+                
+                merged_history = existing_history + new_entries
+                
+                # Save merged history
+                allocation_history_data = {
+                    "last_updated": ts_dt.isoformat(),
+                    "last_close_time": close_time_ms,
+                    "history": merged_history
+                }
+                with open(allocation_history_path, "w", encoding="utf-8") as f:
+                    json.dump(allocation_history_data, f, indent=2, ensure_ascii=False, default=str)
+                logger.debug(f"Saved allocation_history for {agent_name} ({len(merged_history)} total entries)")
+            except Exception as e:
+                logger.error(f"Failed to write allocation_history for {agent_name}: {e}")
+
+        # Save transactions for each agent (append mode to preserve full history)
+        # Store in a single file per agent to accumulate transactions across all trades
+        for agent_name, account in self.accounts.items():
+            transactions_path = self.output_dir / f"{agent_name}_transactions.json"
+            try:
+                # Load existing transactions if file exists
+                existing_transactions = []
+                if transactions_path.exists():
+                    try:
+                        with open(transactions_path, "r", encoding="utf-8") as f:
+                            existing_data = json.load(f)
+                            existing_transactions = existing_data.get("transactions", [])
+                    except Exception:
+                        existing_transactions = []
+                
+                # Convert current transactions to dicts
+                current_transactions_dicts = []
+                for tx in account.transactions:
+                    tx_dict = {
+                        "transaction_id": str(tx.transaction_id),
+                        "ticker": tx.ticker,
+                        "quantity": float(tx.quantity),
+                        "price": float(tx.price),
+                        "transaction_type": tx.transaction_type,
+                        "timestamp": tx.timestamp.isoformat() if isinstance(tx.timestamp, datetime) else str(tx.timestamp),
+                    }
+                    current_transactions_dicts.append(tx_dict)
+                
+                # Merge with existing transactions (avoid duplicates based on transaction_id)
+                existing_ids = {tx.get("transaction_id") for tx in existing_transactions}
+                new_transactions = [
+                    tx for tx in current_transactions_dicts
+                    if tx.get("transaction_id") not in existing_ids
+                ]
+                
+                merged_transactions = existing_transactions + new_transactions
+                
+                # Save merged transactions
+                transactions_data = {
+                    "last_updated": ts_dt.isoformat(),
+                    "last_close_time": close_time_ms,
+                    "transactions": merged_transactions
+                }
+                with open(transactions_path, "w", encoding="utf-8") as f:
+                    json.dump(transactions_data, f, indent=2, ensure_ascii=False, default=str)
+                logger.debug(f"Saved transactions for {agent_name} ({len(merged_transactions)} total entries)")
+            except Exception as e:
+                logger.error(f"Failed to write transactions for {agent_name}: {e}")
+
         # Save LLM input prompts separately as JSONL for efficiency
-        llm_jsonl = dated_dir_path / f"{self.name}_{dstr}_llm_input.jsonl"
+        llm_jsonl = dated_dir_path / f"{dstr}_llm_input.jsonl"
         try:
             with open(llm_jsonl, "a", encoding="utf-8") as f:
                 for agent_name, agent in self.agents.items():
@@ -287,6 +452,221 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
             logger.error(f"Failed to append account summary CSV: {e}")
         return file_path
 
+    def get_latest_trade_date(self) -> Optional[datetime]:
+        """
+        Find the latest trade date from saved parquet files.
+        
+        Returns:
+            Latest trade datetime (UTC) or None if no files found
+        """
+        if not self.output_dir.exists():
+            return None
+        
+        latest_timestamp = None
+        latest_dt = None
+        
+        # Search for parquet files in date subdirectories
+        for date_dir in self.output_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            
+            for parquet_file in date_dir.glob("*.parquet"):
+                # Skip LLM input files if any
+                if "_llm_input" in parquet_file.stem:
+                    continue
+                
+                file_stem = parquet_file.stem
+                # File format: YYYY-MM-DDTHHMMSS.parquet
+                if len(file_stem) == 17 and "T" in file_stem:
+                    try:
+                        file_dt = datetime.strptime(file_stem, "%Y-%m-%dT%H%M%S")
+                        file_dt = file_dt.replace(tzinfo=timezone.utc)
+                        if latest_dt is None or file_dt > latest_dt:
+                            latest_dt = file_dt
+                            latest_timestamp = file_stem
+                    except ValueError:
+                        continue
+        
+        if latest_dt:
+            logger.info(f"Found latest trade date: {latest_timestamp} ({latest_dt})")
+        else:
+            logger.info("No trade files found")
+        
+        return latest_dt
+
+    def load_accounts_from_parquet(self) -> bool:
+        """
+        Load account state from the latest saved parquet file.
+        Restores positions, cash balance, and target allocations.
+        
+        Returns:
+            True if successfully loaded, False otherwise
+        """
+        if not self.output_dir.exists():
+            logger.warning(f"Output directory does not exist: {self.output_dir}")
+            return False
+        
+        # Find the latest parquet file
+        latest_dt = self.get_latest_trade_date()
+        if latest_dt is None:
+            logger.info("No saved trade files found, starting fresh")
+            return False
+        
+        # Find the file path
+        date_dir = latest_dt.strftime("%Y-%m-%d")
+        dated_dir_path = self.output_dir / date_dir
+        file_stem = latest_dt.strftime("%Y-%m-%dT%H%M%S")
+        file_path = dated_dir_path / f"{file_stem}.parquet"
+        
+        if not file_path.exists():
+            logger.warning(f"Latest trade file not found: {file_path}")
+            return False
+        
+        try:
+            # Load parquet file
+            df = pl.read_parquet(str(file_path))
+            if df.is_empty():
+                logger.warning(f"Parquet file is empty: {file_path}")
+                return False
+            
+            logger.info(f"Loading account state from {file_path} ({len(df)} rows)")
+            
+            # Group by agent and restore state
+            for agent_name in df["agent"].unique().to_list():
+                if agent_name not in self.accounts:
+                    logger.warning(f"Agent {agent_name} not found in system, skipping")
+                    continue
+                
+                account = self.accounts[agent_name]
+                agent_df = df.filter(pl.col("agent") == agent_name)
+                
+                # Clear existing positions
+                account.positions.clear()
+                
+                # Restore positions and cash
+                cash_balance = 0.0
+                target_allocations: Dict[str, float] = {}
+                
+                for row in agent_df.iter_rows(named=True):
+                    symbol = row["symbol"]
+                    quantity = float(row["quantity"])
+                    average_price = float(row["average_price"])
+                    current_price = float(row["current_price"])
+                    allocation = float(row.get("allocation", 0.0))
+                    
+                    if symbol == "USDT":
+                        # USDT represents cash balance
+                        cash_balance = quantity
+                        target_allocations["CASH"] = allocation
+                    else:
+                        # Regular position
+                        if quantity > 0.01:  # Only restore meaningful positions
+                            from ..accounts import Position
+                            account.positions[symbol] = Position(
+                                symbol=symbol,
+                                quantity=quantity,
+                                average_price=average_price,
+                                current_price=current_price,
+                                url=None,  # URL is not saved in parquet
+                            )
+                        target_allocations[symbol] = allocation
+                
+                # Restore account state
+                account.cash_balance = cash_balance
+                account.target_allocations = target_allocations
+                
+                logger.info(
+                    f"Restored {agent_name}: {len(account.positions)} positions, "
+                    f"cash={cash_balance:.2f}, total_value={account.get_total_value():.2f}"
+                )
+            
+            # Try to load additional metadata if available
+            metadata_path = dated_dir_path / f"{file_stem}_metadata.json"
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as f:
+                        metadata = json.load(f)
+                    
+                    for agent_name, agent_meta in metadata.get("agents", {}).items():
+                        if agent_name not in self.accounts:
+                            continue
+                        
+                        account = self.accounts[agent_name]
+                        # Restore additional fields from metadata
+                        account.total_fees = float(agent_meta.get("total_fees", 0.0))
+                        account.total_funding_fees = float(agent_meta.get("total_funding_fees", 0.0))
+                        account.last_rebalance = agent_meta.get("last_rebalance")
+                        
+                        # Ensure target_allocations is complete (may have been partially restored from parquet)
+                        meta_allocations = agent_meta.get("target_allocations", {})
+                        if meta_allocations:
+                            # Merge with parquet-loaded allocations (metadata takes precedence)
+                            account.target_allocations.update({k: float(v) for k, v in meta_allocations.items()})
+                    
+                    logger.info(f"Loaded additional metadata from {metadata_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load metadata from {metadata_path}: {e}")
+
+            # Try to load allocation_history from agent-specific files (accumulated across all trades)
+            for agent_name, account in self.accounts.items():
+                allocation_history_path = self.output_dir / f"{agent_name}_allocation_history.json"
+                if allocation_history_path.exists():
+                    try:
+                        with open(allocation_history_path, "r", encoding="utf-8") as f:
+                            allocation_history_data = json.load(f)
+                        
+                        # Restore allocation_history (already a list of dicts)
+                        history_list = allocation_history_data.get("history", [])
+                        account.allocation_history = history_list
+                        logger.debug(f"Restored {len(history_list)} allocation history entries for {agent_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load allocation_history for {agent_name}: {e}")
+                else:
+                    logger.debug(f"No allocation_history file found for {agent_name}")
+
+            # Try to load transactions from agent-specific files (accumulated across all trades)
+            for agent_name, account in self.accounts.items():
+                transactions_path = self.output_dir / f"{agent_name}_transactions.json"
+                if transactions_path.exists():
+                    try:
+                        with open(transactions_path, "r", encoding="utf-8") as f:
+                            transactions_data = json.load(f)
+                        
+                        # Restore transactions by converting dicts back to Transaction objects
+                        from ..accounts import Transaction
+                        import uuid
+                        
+                        transactions_list = transactions_data.get("transactions", [])
+                        restored_transactions = []
+                        for tx_dict in transactions_list:
+                            try:
+                                tx = Transaction(
+                                    transaction_id=uuid.UUID(tx_dict["transaction_id"]),
+                                    ticker=tx_dict["ticker"],
+                                    quantity=float(tx_dict["quantity"]),
+                                    price=float(tx_dict["price"]),
+                                    transaction_type=tx_dict["transaction_type"],
+                                    timestamp=parse_utc_datetime(tx_dict["timestamp"]) if isinstance(tx_dict["timestamp"], str) else tx_dict["timestamp"],
+                                )
+                                restored_transactions.append(tx)
+                            except Exception as e:
+                                logger.warning(f"Failed to restore transaction for {agent_name}: {e}")
+                                continue
+                        
+                        account.transactions = restored_transactions
+                        logger.debug(f"Restored {len(restored_transactions)} transactions for {agent_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load transactions for {agent_name}: {e}")
+                else:
+                    logger.debug(f"No transactions file found for {agent_name}")
+            
+            logger.info(f"Successfully loaded account state from {file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load account state from {file_path}: {e}")
+            return False
+
 
     def attach_price_to_allocations(self, allocations_df: pl.DataFrame) -> pl.DataFrame:
         """
@@ -325,5 +705,3 @@ def create_binance_portfolio_system() -> BinancePortfolioSystem:
     Create a new Binance portfolio system instance.
     """
     return BinancePortfolioSystem()
-
-

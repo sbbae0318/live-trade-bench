@@ -97,8 +97,8 @@ def live_test() -> None:
     load_dotenv()
 
     # Create Binance trading system
-    time_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    system = BinancePortfolioSystem(name="live_" + time_str)
+    #system = BinancePortfolioSystem(name="live_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+    system = BinancePortfolioSystem()
 
     # Add AI agent
     system.add_agent("GPT-4o-mini", initial_cash=10000.0, model_name="openai/gpt-4o-mini")
@@ -110,12 +110,30 @@ def live_test() -> None:
     system.initialize_for_live()
     print(f"Trading {len(system.universe)} contracts: {system.universe}...")
 
-    date = datetime(2025, 11, 25, 0, 0, 0, tzinfo=timezone.utc)
+    # Try to load existing account state from parquet files
+    loaded = system.load_accounts_from_parquet()
+    if loaded:
+        logger.info("Successfully loaded existing account state")
+        # Get the latest trade date and start from the next day
+        latest_trade_date = system.get_latest_trade_date()
+        if latest_trade_date:
+            # Start from the day after the latest trade
+            date = latest_trade_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            logger.info(f"Resuming from {date.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        else:
+            # Fallback to default start date
+            date = datetime(2025, 11, 25, 0, 0, 0, tzinfo=timezone.utc)
+            logger.info(f"No trade date found, starting from default: {date.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    else:
+        # No existing state, start from default date
+        date = datetime(2025, 11, 25, 0, 0, 0, tzinfo=timezone.utc)
+        logger.info(f"No existing state found, starting fresh from {date.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    
     date_end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     delt = timedelta(days=1)
 
     # Run trading cycles
-    while date < date_end:
+    while date <= date_end:
         date_str = date.strftime("%Y-%m-%d %H:%M:%S UTC")
         system.run_cycle(for_date=date_str)
         date = date + delt

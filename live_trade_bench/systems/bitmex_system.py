@@ -381,6 +381,66 @@ class BitMEXPortfolioSystem:
             logger.info("All allocations generated")
         return all_allocations
 
+    def _validate_and_fix_allocation(
+        self,
+        agent_name: str,
+        allocation: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Validate that allocations sum to 1.0 and adjust USDT allocation if needed.
+        
+        Args:
+            agent_name: Name of the agent
+            allocation: Dictionary mapping symbol to allocation weight
+            
+        Returns:
+            Validated allocation dictionary with sum equal to 1.0
+        """
+        # Calculate total allocation
+        total_allocation = sum(allocation.values())
+        
+        # Check if allocation is valid (within tolerance)
+        tolerance = 1e-6
+        if abs(total_allocation - 1.0) < tolerance:
+            return allocation
+        
+        # Log the issue
+        logger.warning(
+            f"Agent {agent_name}: Allocation sum is {total_allocation:.6f} (not 1.0). "
+            f"Adjusting USDT allocation to fix."
+        )
+        
+        # Create a copy to avoid modifying the original
+        fixed_allocation = allocation.copy()
+        
+        # Calculate the difference
+        diff = 1.0 - total_allocation
+        
+        # Adjust USDT allocation
+        if "USDT" in fixed_allocation:
+            original_usdt = fixed_allocation["USDT"]
+            fixed_allocation["USDT"] = original_usdt + diff
+            logger.info(
+                f"Agent {agent_name}: Adjusted USDT allocation from {original_usdt:.6f} "
+                f"to {fixed_allocation['USDT']:.6f} (diff: {diff:+.6f})"
+            )
+        else:
+            # If USDT is not in allocation, add it with the difference
+            fixed_allocation["USDT"] = diff
+            logger.info(
+                f"Agent {agent_name}: Added USDT allocation of {diff:.6f} "
+                f"to reach total of 1.0"
+            )
+        
+        # Verify the fix
+        new_total = sum(fixed_allocation.values())
+        logger.info(
+            f"Agent {agent_name}: Fixed allocation sum: {new_total:.6f} "
+            f"(symbols: {list(fixed_allocation.keys())})"
+        )
+        
+        return fixed_allocation
+    
     def _update_accounts(
         self,
         allocations: Dict[str, Dict[str, float]],
@@ -448,12 +508,15 @@ class BitMEXPortfolioSystem:
                 metadata_map = {}
 
         for agent_name, allocation in allocations.items():
+            # Validate and fix allocation to ensure it sums to 1.0
+            validated_allocation = self._validate_and_fix_allocation(agent_name, allocation)
+            
             account = self.accounts[agent_name]
-            account.target_allocations = allocation
+            account.target_allocations = validated_allocation
 
             try:
                 account.apply_allocation(
-                    allocation, price_map=price_map, metadata_map=metadata_map
+                    validated_allocation, price_map=price_map, metadata_map=metadata_map
                 )
 
                 # Capture LLM input/output for audit trail

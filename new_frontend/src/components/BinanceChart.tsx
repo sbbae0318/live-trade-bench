@@ -1,0 +1,937 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  TimeScale,
+} from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
+import { Line } from 'react-chartjs-2';
+import 'chartjs-adapter-date-fns';
+import './BinanceChart.css';
+
+// Chart.js 등록
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  TimeScale,
+  zoomPlugin
+);
+
+interface ChartDataPoint {
+  timestamp: string;
+  close_time: number;
+  price: number;
+  quantity: number;
+  allocation: number;
+  position_value: number;
+}
+
+interface ChartData {
+  [symbol: string]: ChartDataPoint[];
+}
+
+interface TotalValueDataPoint {
+  timestamp: string;
+  close_time: number;
+  total_value: number;
+}
+
+interface BinanceChartProps {
+  agentName?: string;
+  symbols?: string[];
+  updateInterval?: number; // 초 단위
+}
+
+const BinanceChart: React.FC<BinanceChartProps> = ({
+  agentName,
+  symbols,
+  updateInterval = 30,
+}) => {
+  const [activeTab, setActiveTab] = useState<'overview' | 'details'>('overview'); // 탭 상태
+  const overviewChartRef = React.useRef<any>(null);
+  
+  // Overview 탭용 상태 (모든 에이전트의 total value)
+  const [agents, setAgents] = useState<string[]>([]);
+  const [allAgentsTotalValue, setAllAgentsTotalValue] = useState<{[agent: string]: TotalValueDataPoint[]}>({});
+  const [overviewLoading, setOverviewLoading] = useState<boolean>(true);
+  const [overviewUpdating, setOverviewUpdating] = useState<boolean>(false);
+  
+  // Details 탭용 상태 (기존 심볼별 차트)
+  const [selectedAgent, setSelectedAgent] = useState<string>(agentName || '');
+  const [availableSymbols, setAvailableSymbols] = useState<string[]>([]);
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>(symbols || []);
+  const [chartData, setChartData] = useState<ChartData>({});
+  const [totalValueData, setTotalValueData] = useState<TotalValueDataPoint[]>([]);
+  const [detailsLoading, setDetailsLoading] = useState<boolean>(true);
+  const [detailsUpdating, setDetailsUpdating] = useState<boolean>(false);
+  
+  // 공통 상태
+  const [error, setError] = useState<string | null>(null);
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [timeUntilNextUpdate, setTimeUntilNextUpdate] = useState<number>(updateInterval);
+  
+  // 포트폴리오 비중 상태
+  const [portfolioWeights, setPortfolioWeights] = useState<{[agent: string]: {
+    symbols: {[symbol: string]: {
+      allocation: number;
+      actual_weight: number;
+      position_value: number;
+      current_price: number;
+      quantity: number;
+    }};
+    total_value: number;
+  }}>({});
+  const [portfolioLoading, setPortfolioLoading] = useState<boolean>(true);
+
+  // API 기본 URL
+  const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+
+  // 에이전트 목록 가져오기
+  const fetchAgents = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/binance/chart/agents`);
+      if (!response.ok) {
+        throw new Error('Failed to fetch agents');
+      }
+      const data = await response.json();
+      setAgents(data.agents || []);
+      
+      // 첫 번째 에이전트 선택 (Details 탭용)
+      if (!selectedAgent && data.agents && data.agents.length > 0) {
+        setSelectedAgent(data.agents[0]);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch agents');
+    }
+  }, [selectedAgent, API_BASE_URL]);
+
+  // 포트폴리오 비중 가져오기
+  const fetchPortfolioWeights = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/binance/chart/portfolio-weights`);
+      if (!response.ok) {
+        throw new Error('Failed to fetch portfolio weights');
+      }
+      const data = await response.json();
+      setPortfolioWeights(data.portfolio_weights || {});
+      setPortfolioLoading(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch portfolio weights');
+      setPortfolioLoading(false);
+    }
+  }, [API_BASE_URL]);
+
+  // Overview 탭: 모든 에이전트의 total value 가져오기
+  const fetchAllAgentsTotalValue = useCallback(async (isInitial: boolean = false) => {
+    if (agents.length === 0) {
+      return;
+    }
+
+    if (!isInitial) {
+      setOverviewUpdating(true);
+    } else {
+      setOverviewLoading(true);
+    }
+    setError(null);
+
+    try {
+      // 모든 에이전트의 total value를 병렬로 가져오기
+      const responses = await Promise.all(
+        agents.map(agent => 
+          fetch(`${API_BASE_URL}/api/binance/chart/${agent}/total-value`)
+            .then(res => res.ok ? res.json() : null)
+            .catch(() => null)
+        )
+      );
+
+      const agentsData: {[agent: string]: TotalValueDataPoint[]} = {};
+      responses.forEach((data, index) => {
+        if (data && data.data) {
+          agentsData[agents[index]] = data.data;
+        }
+      });
+
+      setAllAgentsTotalValue(agentsData);
+      const now = new Date();
+      setLastUpdate(now);
+      setTimeUntilNextUpdate(updateInterval);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch all agents total value');
+    } finally {
+      if (isInitial) {
+        setOverviewLoading(false);
+      } else {
+        setOverviewUpdating(false);
+      }
+    }
+  }, [agents, API_BASE_URL]);
+
+  // 심볼 목록 가져오기
+  const fetchSymbols = useCallback(async (agent: string) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/binance/chart/${agent}/symbols`);
+      if (!response.ok) {
+        throw new Error('Failed to fetch symbols');
+      }
+      const data = await response.json();
+      setAvailableSymbols(data.symbols || []);
+      
+      // 선택된 심볼이 없으면 모든 심볼 선택
+      if (selectedSymbols.length === 0 && data.symbols && data.symbols.length > 0) {
+        setSelectedSymbols(data.symbols);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch symbols');
+    }
+  }, [selectedSymbols, API_BASE_URL]);
+
+  // 차트 데이터 가져오기
+  const fetchChartData = useCallback(async (agent: string, symbolsList: string[], isInitial: boolean = false) => {
+    if (!agent || symbolsList.length === 0) {
+      return;
+    }
+
+      // 초기 로딩이 아닌 경우에만 updating 상태 설정 (화면 깜빡임 방지)
+    if (!isInitial) {
+      setDetailsUpdating(true);
+    } else {
+      setDetailsLoading(true);
+    }
+    setError(null);
+
+    try {
+      const symbolsParam = symbolsList.join(',');
+      
+      // 심볼별 차트 데이터와 total 가치 데이터를 병렬로 가져오기
+      const [chartResponse, totalValueResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/binance/chart/${agent}/data?symbols=${symbolsParam}&include_realtime=true`),
+        fetch(`${API_BASE_URL}/api/binance/chart/${agent}/total-value`)
+      ]);
+      
+      if (!chartResponse.ok) {
+        throw new Error('Failed to fetch chart data');
+      }
+      
+      if (!totalValueResponse.ok) {
+        throw new Error('Failed to fetch total value data');
+      }
+      
+      const chartDataResult = await chartResponse.json();
+      const totalValueResult = await totalValueResponse.json();
+      
+      // 데이터 업데이트를 배치로 처리하여 렌더링 최적화
+      setChartData(prevData => {
+        // 기존 데이터와 새 데이터를 병합 (스크롤 위치 유지)
+        return { ...prevData, ...chartDataResult.data };
+      });
+      
+      setTotalValueData(totalValueResult.data || []);
+      const now = new Date();
+      setLastUpdate(now);
+      setTimeUntilNextUpdate(updateInterval);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch chart data');
+    } finally {
+      if (isInitial) {
+        setDetailsLoading(false);
+      } else {
+        setDetailsUpdating(false);
+      }
+    }
+  }, [API_BASE_URL]);
+
+  // 초기 로드: 에이전트 목록 가져오기
+  useEffect(() => {
+    fetchAgents();
+    fetchPortfolioWeights();
+  }, [fetchAgents, fetchPortfolioWeights]);
+
+  // 포트폴리오 비중 주기적 업데이트
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchPortfolioWeights();
+    }, updateInterval * 1000);
+
+    return () => clearInterval(interval);
+  }, [fetchPortfolioWeights, updateInterval]);
+
+  // Overview 탭: 에이전트 목록이 로드되면 total value 가져오기
+  useEffect(() => {
+    if (agents.length > 0) {
+      fetchAllAgentsTotalValue(true);
+    }
+  }, [agents.length]); // agents.length만 의존성으로 사용
+
+  // Overview 탭: 주기적 업데이트
+  useEffect(() => {
+    if (activeTab !== 'overview' || agents.length === 0) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      fetchAllAgentsTotalValue(false);
+    }, updateInterval * 1000);
+
+    return () => clearInterval(interval);
+  }, [activeTab, agents.length, updateInterval, fetchAllAgentsTotalValue]);
+
+  // 에이전트 변경 시 심볼 가져오기
+  useEffect(() => {
+    if (selectedAgent) {
+      fetchSymbols(selectedAgent);
+    }
+  }, [selectedAgent, fetchSymbols]);
+
+  // Details 탭: 차트 데이터 업데이트 (초기 로드)
+  useEffect(() => {
+    if (activeTab === 'details' && selectedAgent && selectedSymbols.length > 0) {
+      fetchChartData(selectedAgent, selectedSymbols, true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedAgent, selectedSymbols.join(',')]); // activeTab 추가
+
+  // Details 탭: 주기적 업데이트
+  useEffect(() => {
+    if (activeTab !== 'details' || !selectedAgent || selectedSymbols.length === 0 || detailsLoading) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      fetchChartData(selectedAgent, selectedSymbols, false);
+    }, updateInterval * 1000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedAgent, selectedSymbols.join(','), updateInterval, detailsLoading]);
+
+  // 다음 업데이트까지 남은 시간 계산 (1초마다 업데이트)
+  useEffect(() => {
+    if (!lastUpdate) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      const now = new Date();
+      const elapsed = Math.floor((now.getTime() - lastUpdate.getTime()) / 1000);
+      const remaining = Math.max(0, updateInterval - elapsed);
+      setTimeUntilNextUpdate(remaining);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [lastUpdate, updateInterval]);
+
+  // 차트 옵션 설정
+  const getChartOptions = (symbol: string) => {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      elements: {
+        point: {
+          radius: 0,
+          hoverRadius: 0,
+          borderWidth: 0,
+          backgroundColor: 'transparent',
+        },
+      },
+      plugins: {
+        legend: {
+          position: 'top' as const,
+        },
+        title: {
+          display: true,
+          text: `${symbol} - Price History`,
+        },
+        tooltip: {
+          mode: 'index' as const,
+          intersect: false,
+          callbacks: {
+            label: function(context: any) {
+              const point = chartData[symbol]?.[context.dataIndex];
+              if (!point) return '';
+              
+              if (context.datasetIndex === 0) {
+                return `Price: $${point.price.toFixed(4)}`;
+              } else {
+                return `Position Value: $${point.position_value.toFixed(2)}`;
+              }
+            },
+            afterBody: function(context: any) {
+              const point = chartData[symbol]?.[context[0]?.dataIndex];
+              if (!point) return '';
+              
+              return [
+                `Quantity: ${point.quantity.toFixed(4)}`,
+                `Allocation: ${(point.allocation * 100).toFixed(2)}%`,
+              ];
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time' as const,
+          time: {
+            unit: 'minute' as const,
+            displayFormats: {
+              minute: 'HH:mm',
+            },
+          },
+          title: {
+            display: true,
+            text: 'Time',
+          },
+        },
+        y: {
+          type: 'linear' as const,
+          position: 'left' as const,
+          title: {
+            display: true,
+            text: 'Price (USDT)',
+          },
+        },
+        y1: {
+          type: 'linear' as const,
+          position: 'right' as const,
+          title: {
+            display: true,
+            text: 'Position Value (USDT)',
+          },
+          grid: {
+            drawOnChartArea: false,
+          },
+        },
+      },
+    };
+  };
+
+  // 차트 데이터 변환
+  const getChartDataForSymbol = (symbol: string) => {
+    const dataPoints = chartData[symbol] || [];
+    
+    return {
+      datasets: [
+        {
+          label: 'Price',
+          data: dataPoints.map((point) => ({
+            x: new Date(point.timestamp),
+            y: point.price,
+          })),
+          borderColor: 'rgb(75, 192, 192)',
+          backgroundColor: 'rgba(75, 192, 192, 0.2)',
+          tension: 0.1,
+          borderWidth: 1,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          pointBorderWidth: 0,
+          pointBackgroundColor: 'transparent',
+          yAxisID: 'y',
+        },
+        {
+          label: 'Position Value',
+          data: dataPoints.map((point) => ({
+            x: new Date(point.timestamp),
+            y: point.position_value,
+          })),
+          borderColor: 'rgb(255, 99, 132)',
+          backgroundColor: 'rgba(255, 99, 132, 0.2)',
+          tension: 0.1,
+          borderWidth: 1,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          pointBorderWidth: 0,
+          pointBackgroundColor: 'transparent',
+          yAxisID: 'y1',
+        },
+      ],
+    };
+  };
+
+  // Total Value 차트 데이터 변환
+  const getTotalValueChartData = () => {
+    return {
+      datasets: [
+        {
+          label: 'Total Value',
+          data: totalValueData.map((point) => ({
+            x: new Date(point.timestamp),
+            y: point.total_value,
+          })),
+          borderColor: 'rgb(54, 162, 235)',
+          backgroundColor: 'rgba(54, 162, 235, 0.2)',
+          tension: 0.1,
+          borderWidth: 1,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          pointBorderWidth: 0,
+          pointBackgroundColor: 'transparent',
+          fill: true,
+        },
+      ],
+    };
+  };
+
+  // Overview 탭: 모든 에이전트의 total value 차트 데이터
+  const getAllAgentsTotalValueChartData = () => {
+    const datasets = agents.map((agent, index) => {
+      const data = allAgentsTotalValue[agent] || [];
+      const colors = [
+        'rgb(54, 162, 235)',
+        'rgb(255, 99, 132)',
+        'rgb(75, 192, 192)',
+        'rgb(255, 159, 64)',
+        'rgb(153, 102, 255)',
+        'rgb(201, 203, 207)',
+      ];
+      const color = colors[index % colors.length];
+      
+      return {
+        label: agent,
+        data: data.map((point) => ({
+          x: new Date(point.timestamp),
+          y: point.total_value,
+        })),
+        borderColor: color,
+        backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
+        tension: 0.1,
+        borderWidth: 1,
+        pointRadius: 0,
+        pointHoverRadius: 0,
+        pointBorderWidth: 0,
+        pointBackgroundColor: 'transparent',
+        fill: false,
+      };
+    });
+
+    return { datasets };
+  };
+
+  // Overview 탭: 모든 에이전트의 total value 차트 옵션
+  const getAllAgentsTotalValueChartOptions = () => {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      elements: {
+        point: {
+          radius: 0,
+          hoverRadius: 0,
+          borderWidth: 0,
+          backgroundColor: 'transparent',
+        },
+      },
+      plugins: {
+        legend: {
+          position: 'top' as const,
+        },
+        title: {
+          display: true,
+          text: 'All Agents - Total Portfolio Value Comparison',
+        },
+        tooltip: {
+          mode: 'index' as const,
+          intersect: false,
+          callbacks: {
+            label: function(context: any) {
+              return `${context.dataset.label}: $${context.parsed.y.toFixed(2)}`;
+            },
+          },
+        },
+        zoom: {
+          zoom: {
+            wheel: {
+              enabled: true,
+              speed: 0.1,
+            },
+            pinch: {
+              enabled: true,
+            },
+            mode: 'x' as const, // x축만 줌 (시간축)
+          },
+          pan: {
+            enabled: true,
+            mode: 'x' as const, // x축만 팬 (시간축)
+            modifierKey: 'shift' as const, // Shift 키를 누른 상태에서 드래그로 팬
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time' as const,
+          time: {
+            unit: 'day' as const,
+            displayFormats: {
+              day: 'MMM dd',
+            },
+          },
+          title: {
+            display: true,
+            text: 'Date',
+          },
+        },
+        y: {
+          type: 'linear' as const,
+          position: 'left' as const,
+          title: {
+            display: true,
+            text: 'Total Value (USDT)',
+          },
+        },
+      },
+    };
+  };
+
+  // Details 탭: Total Value 차트 옵션
+  const getTotalValueChartOptions = () => {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      elements: {
+        point: {
+          radius: 0,
+          hoverRadius: 0,
+          borderWidth: 0,
+          backgroundColor: 'transparent',
+        },
+      },
+      plugins: {
+        legend: {
+          position: 'top' as const,
+        },
+        title: {
+          display: true,
+          text: 'Total Portfolio Value',
+        },
+        tooltip: {
+          mode: 'index' as const,
+          intersect: false,
+          callbacks: {
+            label: function(context: any) {
+              return `Total Value: $${context.parsed.y.toFixed(2)}`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time' as const,
+          time: {
+            unit: 'day' as const,
+            displayFormats: {
+              day: 'MMM dd',
+            },
+          },
+          title: {
+            display: true,
+            text: 'Date',
+          },
+        },
+        y: {
+          type: 'linear' as const,
+          position: 'left' as const,
+          title: {
+            display: true,
+            text: 'Total Value (USDT)',
+          },
+        },
+      },
+    };
+  };
+
+  return (
+    <div className="binance-chart-container">
+      {/* 탭 메뉴 */}
+      <div className="chart-tabs">
+        <button
+          className={`tab-button ${activeTab === 'overview' ? 'active' : ''}`}
+          onClick={() => setActiveTab('overview')}
+        >
+          Overview
+        </button>
+        <button
+          className={`tab-button ${activeTab === 'details' ? 'active' : ''}`}
+          onClick={() => setActiveTab('details')}
+        >
+          Details
+        </button>
+      </div>
+
+      {/* Overview 탭 */}
+      {activeTab === 'overview' && (
+        <div className="tab-content">
+          {overviewLoading && (
+            <div className="loading-message">Loading overview data...</div>
+          )}
+
+          {overviewUpdating && !overviewLoading && (
+            <div className="updating-indicator">Updating...</div>
+          )}
+
+          {lastUpdate && activeTab === 'overview' && (
+            <div className="update-status-overview">
+              <div className="last-update-overview">
+                Last update: {lastUpdate.toLocaleTimeString()}
+              </div>
+              <div className="next-update-countdown-overview">
+                <div className="countdown-label">Next update in:</div>
+                <div className="countdown-timer">
+                  <span className="countdown-value">{timeUntilNextUpdate}</span>
+                  <span className="countdown-unit">s</span>
+                </div>
+                <div className="countdown-progress-bar">
+                  <div 
+                    className="countdown-progress-fill"
+                    style={{ width: `${((updateInterval - timeUntilNextUpdate) / updateInterval) * 100}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!overviewLoading && agents.length > 0 && (
+            <div className="overview-layout">
+              <div className="overview-chart-container">
+                <div className="chart-zoom-controls">
+                  <button 
+                    className="zoom-button"
+                    onClick={() => {
+                      if (overviewChartRef.current) {
+                        const chart = overviewChartRef.current;
+                        if (chart && chart.zoom) {
+                          chart.zoom(1.2);
+                        }
+                      }
+                    }}
+                    title="Zoom In"
+                  >
+                    +
+                  </button>
+                  <button 
+                    className="zoom-button"
+                    onClick={() => {
+                      if (overviewChartRef.current) {
+                        const chart = overviewChartRef.current;
+                        if (chart && chart.zoom) {
+                          chart.zoom(0.8);
+                        }
+                      }
+                    }}
+                    title="Zoom Out"
+                  >
+                    −
+                  </button>
+                  <button 
+                    className="zoom-button"
+                    onClick={() => {
+                      if (overviewChartRef.current) {
+                        const chart = overviewChartRef.current;
+                        if (chart && chart.resetZoom) {
+                          chart.resetZoom();
+                        }
+                      }
+                    }}
+                    title="Reset Zoom"
+                  >
+                    ⟲
+                  </button>
+                  <span className="zoom-hint">마우스 휠로 줌, Shift+드래그로 이동</span>
+                </div>
+              <div className="chart-wrapper overview-chart">
+                <Line
+                    ref={overviewChartRef}
+                  data={getAllAgentsTotalValueChartData()}
+                  options={getAllAgentsTotalValueChartOptions()}
+                  updateMode="none"
+                  redraw={false}
+                />
+                </div>
+              </div>
+              <div className="portfolio-weights-container">
+                <h3 className="portfolio-weights-title">Portfolio Weights</h3>
+                {portfolioLoading ? (
+                  <div className="loading-message">Loading portfolio weights...</div>
+                ) : (
+                  <div className="portfolio-weights-table-container">
+                    {Object.entries(portfolioWeights).map(([agent, data]) => (
+                      <div key={agent} className="portfolio-agent-section">
+                        <h4 className="portfolio-agent-name">{agent}</h4>
+                        <div className="portfolio-total-value">
+                          Total: ${data.total_value.toFixed(2)}
+                        </div>
+                        <table className="portfolio-table">
+                          <thead>
+                            <tr>
+                              <th>Symbol</th>
+                              <th>Target</th>
+                              <th>Actual</th>
+                              <th>Value</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Object.entries(data.symbols)
+                              .sort(([, a], [, b]) => b.actual_weight - a.actual_weight)
+                              .map(([symbol, info]) => (
+                                <tr key={symbol}>
+                                  <td className="symbol-cell">{symbol}</td>
+                                  <td className="weight-cell">{info.allocation.toFixed(1)}%</td>
+                                  <td className={`weight-cell ${Math.abs(info.allocation - info.actual_weight) > 1 ? 'weight-diff' : ''}`}>
+                                    {info.actual_weight.toFixed(1)}%
+                                  </td>
+                                  <td className="value-cell">${info.position_value.toFixed(2)}</td>
+                                </tr>
+                              ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!overviewLoading && agents.length === 0 && (
+            <div className="no-data-message">
+              No agents available.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Details 탭 */}
+      {activeTab === 'details' && (
+        <div className="tab-content">
+          <div className="binance-chart-controls">
+        <div className="control-group">
+          <label htmlFor="agent-select">Agent:</label>
+          <select
+            id="agent-select"
+            value={selectedAgent}
+            onChange={(e) => setSelectedAgent(e.target.value)}
+          >
+            <option value="">Select Agent</option>
+            {agents.map((agent) => (
+              <option key={agent} value={agent}>
+                {agent}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="control-group">
+          <label>Symbols:</label>
+          <div className="symbol-checkboxes">
+            {availableSymbols.map((symbol) => (
+              <label key={symbol} className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={selectedSymbols.includes(symbol)}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      setSelectedSymbols([...selectedSymbols, symbol]);
+                    } else {
+                      setSelectedSymbols(selectedSymbols.filter((s) => s !== symbol));
+                    }
+                  }}
+                />
+                {symbol}
+              </label>
+            ))}
+          </div>
+        </div>
+
+            {lastUpdate && (
+              <div className="update-status">
+              <div className="last-update">
+                Last update: {lastUpdate.toLocaleTimeString()}
+                </div>
+                <div className="next-update-countdown">
+                  <div className="countdown-label">Next update in:</div>
+                  <div className="countdown-timer">
+                    <span className="countdown-value">{timeUntilNextUpdate}</span>
+                    <span className="countdown-unit">s</span>
+                  </div>
+                  <div className="countdown-progress-bar">
+                    <div 
+                      className="countdown-progress-fill"
+                      style={{ width: `${((updateInterval - timeUntilNextUpdate) / updateInterval) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {error && <div className="error-message">Error: {error}</div>}
+
+          {/* 초기 로딩만 전체 화면 표시 */}
+          {detailsLoading && (
+            <div className="loading-message">Loading chart data...</div>
+          )}
+
+          {/* 업데이트 중일 때는 작은 인디케이터만 표시 */}
+          {detailsUpdating && !detailsLoading && (
+            <div className="updating-indicator">Updating...</div>
+          )}
+
+          {/* 초기 로딩이 완료되면 차트 표시 (스크롤 위치 유지) */}
+          {!detailsLoading && (
+            <div className="chart-grid">
+              {/* Total Value 차트 */}
+              {totalValueData.length > 0 && (
+                <div className="chart-wrapper total-value-chart">
+                  <Line
+                    data={getTotalValueChartData()}
+                    options={getTotalValueChartOptions()}
+                    updateMode="none"
+                    redraw={false}
+                  />
+                </div>
+              )}
+
+              {/* 심볼별 차트 */}
+              {selectedSymbols.length > 0 && selectedSymbols.map((symbol) => {
+            const symbolData = chartData[symbol];
+            if (!symbolData || symbolData.length === 0) {
+              return (
+                <div key={symbol} className="chart-placeholder">
+                  No data available for {symbol}
+                </div>
+              );
+            }
+
+            return (
+              <div key={symbol} className="chart-wrapper">
+                <Line
+                  data={getChartDataForSymbol(symbol)}
+                  options={getChartOptions(symbol)}
+                  updateMode="none" // 자동 업데이트 비활성화
+                  redraw={false} // 재생성하지 않고 업데이트만
+                />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+          {!detailsLoading && selectedSymbols.length === 0 && totalValueData.length === 0 && (
+            <div className="no-data-message">
+              Please select at least one symbol to display charts.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default BinanceChart;

@@ -4,6 +4,7 @@ import Dashboard from './components/Dashboard';
 import StockDashboard from './components/StockDashboard';
 import PolymarketDashboard from './components/PolymarketDashboard';
 import BitMEXDashboard from './components/BitMEXDashboard';
+import BinanceChart from './components/BinanceChart';
 import News from './components/News';
 import SocialMedia from './components/SocialMedia';
 import About from './components/About';
@@ -412,6 +413,9 @@ function App() {
                 modelsLastRefresh={modelsLastRefresh}
                 isLoading={isLoading}
               />
+            } />
+            <Route path="/binance-chart" element={
+              <BinanceChart />
             } />
             <Route path="/news" element={
               <News

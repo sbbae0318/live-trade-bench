@@ -59,6 +59,12 @@ const Navigation: React.FC = () => {
             BitMEX
           </button>
           <button
+            className={`nav-link ${location.pathname === '/binance-chart' ? 'active' : ''}`}
+            onClick={() => navigate('/binance-chart')}
+          >
+            Binance Chart
+          </button>
+          <button
             className={`nav-link ${location.pathname === '/news' ? 'active' : ''}`}
             onClick={() => navigate('/news')}
           >
@@ -155,6 +161,12 @@ const Navigation: React.FC = () => {
             onClick={() => navigateAndCloseMobile('/bitmex')}
           >
             BitMEX
+          </button>
+          <button
+            className={`mobile-nav-link ${location.pathname === '/binance-chart' ? 'active' : ''}`}
+            onClick={() => navigateAndCloseMobile('/binance-chart')}
+          >
+            Binance Chart
           </button>
           <button
             className={`mobile-nav-link ${location.pathname === '/news' ? 'active' : ''}`}
