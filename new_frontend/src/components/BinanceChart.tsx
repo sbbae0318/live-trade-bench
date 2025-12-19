@@ -15,6 +15,29 @@ import { Line } from 'react-chartjs-2';
 import 'chartjs-adapter-date-fns';
 import './BinanceChart.css';
 
+// Crosshair 플러그인 (버티컬 라인) - 전문 용어: Crosshair 또는 Cursor Line
+const crosshairPlugin = {
+  id: 'crosshair',
+  afterDraw: (chart: any) => {
+    if (chart.tooltip && chart.tooltip._active && chart.tooltip._active.length > 0) {
+      const ctx = chart.ctx;
+      const activePoint = chart.tooltip._active[0];
+      const x = activePoint.element.x;
+      const yAxis = chart.scales.y;
+      
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x, yAxis.top);
+      ctx.lineTo(x, yAxis.bottom);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(25, 118, 210, 0.5)';
+      ctx.setLineDash([5, 5]);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+};
+
 // Chart.js 등록
 ChartJS.register(
   CategoryScale,
@@ -25,7 +48,8 @@ ChartJS.register(
   Tooltip,
   Legend,
   TimeScale,
-  zoomPlugin
+  zoomPlugin,
+  crosshairPlugin
 );
 
 interface ChartDataPoint {
@@ -93,6 +117,29 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
     total_value: number;
   }}>({});
   const [portfolioLoading, setPortfolioLoading] = useState<boolean>(true);
+
+  // Snapshot Modal 상태
+  const [snapshotModalOpen, setSnapshotModalOpen] = useState<boolean>(false);
+  const [snapshotData, setSnapshotData] = useState<{
+    close_time: number;
+    timestamp: string | null;
+    snapshot: {
+      [agent: string]: {
+        timestamp: string | null;
+        close_time: number;
+        symbols: {
+          [symbol: string]: {
+            allocation: number;
+            current_price: number;
+            quantity: number;
+            position_value: number;
+            average_price: number;
+          };
+        };
+      };
+    };
+  } | null>(null);
+  const [snapshotLoading, setSnapshotLoading] = useState<boolean>(false);
 
   // API 기본 URL
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
@@ -500,6 +547,7 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
         data: data.map((point) => ({
           x: new Date(point.timestamp),
           y: point.total_value,
+          close_time: point.close_time, // 클릭 이벤트에서 사용하기 위해 추가
         })),
         borderColor: color,
         backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
@@ -587,10 +635,81 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
           },
         },
       },
+      onClick: (event: any, elements: any[]) => {
+        const chart = event.chart;
+        if (!chart || !chart.canvas) return;
+        
+        const canvas = chart.canvas;
+        const rect = canvas.getBoundingClientRect();
+        const nativeEvent = event.native as MouseEvent | null;
+        
+        if (!nativeEvent) return;
+        
+        const x = nativeEvent.clientX - rect.left;
+        
+        // 클릭한 x 좌표에 해당하는 시간값 찾기
+        const xValue = chart.scales.x.getValueForPixel(x);
+        
+        if (xValue) {
+          // xValue를 Date 객체로 변환 (이미 Date이거나 숫자일 수 있음)
+          const clickedTime = xValue instanceof Date ? xValue.getTime() : new Date(xValue).getTime();
+          
+          // 모든 데이터셋에서 해당 시간에 가장 가까운 데이터 포인트 찾기
+          let closestCloseTime: number | null = null;
+          let minTimeDiff = Infinity;
+          
+          chart.data.datasets.forEach((dataset: any) => {
+            dataset.data.forEach((point: any) => {
+              if (point && point.x && point.close_time) {
+                // point.x도 Date 객체 또는 숫자일 수 있음
+                const pointTime = point.x instanceof Date ? point.x.getTime() : new Date(point.x).getTime();
+                const timeDiff = Math.abs(pointTime - clickedTime);
+                if (timeDiff < minTimeDiff) {
+                  minTimeDiff = timeDiff;
+                  closestCloseTime = point.close_time;
+                }
+              }
+            });
+          });
+          
+          // 5분(300000ms) 이내의 차이면 해당 시점으로 간주
+          if (closestCloseTime && minTimeDiff < 300000) {
+            fetchSnapshotData(closestCloseTime);
+          }
+        }
+      },
+      onHover: (event: any, elements: any[]) => {
+        // 마우스 커서를 포인터로 변경
+        if (event.native) {
+          event.native.target.style.cursor = 'pointer';
+        }
+      },
+      interaction: {
+        mode: 'index' as const,
+        intersect: false,
+      },
     };
   };
 
   // Details 탭: Total Value 차트 옵션
+  // Snapshot 데이터 가져오기
+  const fetchSnapshotData = useCallback(async (closeTime: number) => {
+    setSnapshotLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/binance/chart/snapshot/${closeTime}`);
+      if (!response.ok) {
+        throw new Error('Failed to fetch snapshot data');
+      }
+      const data = await response.json();
+      setSnapshotData(data);
+      setSnapshotModalOpen(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch snapshot data');
+    } finally {
+      setSnapshotLoading(false);
+    }
+  }, [API_BASE_URL]);
+
   const getTotalValueChartOptions = () => {
     return {
       responsive: true,
@@ -643,6 +762,28 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
             text: 'Total Value (USDT)',
           },
         },
+      },
+      onClick: (event: any, elements: any[]) => {
+        if (elements.length > 0) {
+          const element = elements[0];
+          const chart = event.chart;
+          const datasetIndex = element.datasetIndex;
+          const index = element.index;
+          
+          // 해당 데이터 포인트의 close_time 가져오기
+          const dataset = chart.data.datasets[datasetIndex];
+          const dataPoint = dataset.data[index];
+          
+          if (dataPoint && dataPoint.close_time) {
+            fetchSnapshotData(dataPoint.close_time);
+          }
+        }
+      },
+      onHover: (event: any, elements: any[]) => {
+        // 마우스 커서를 포인터로 변경
+        if (event.native) {
+          event.native.target.style.cursor = elements.length > 0 ? 'pointer' : 'default';
+        }
       },
     };
   };
@@ -928,6 +1069,74 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
               Please select at least one symbol to display charts.
             </div>
           )}
+        </div>
+      )}
+
+      {/* Snapshot Modal */}
+      {snapshotModalOpen && (
+        <div className="modal-overlay" onClick={() => setSnapshotModalOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Snapshot at Selected Time</h2>
+              <button className="modal-close" onClick={() => setSnapshotModalOpen(false)}>
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              {snapshotLoading ? (
+                <div className="loading-message">Loading snapshot data...</div>
+              ) : snapshotData ? (
+                <>
+                  <div className="snapshot-info">
+                    <p><strong>Timestamp:</strong> {snapshotData.timestamp || new Date(snapshotData.close_time).toLocaleString()}</p>
+                    <p><strong>Close Time:</strong> {snapshotData.close_time}</p>
+                  </div>
+                  <div className="snapshot-agents">
+                    {Object.entries(snapshotData.snapshot).map(([agentName, agentData]) => {
+                      const symbols = Object.entries(agentData.symbols);
+                      const totalAllocation = symbols.reduce((sum, [, data]) => sum + data.allocation, 0);
+                      
+                      return (
+                        <div key={agentName} className="snapshot-agent-section">
+                          <h3>{agentName}</h3>
+                          <div className="snapshot-agent-info">
+                            <p><strong>Timestamp:</strong> {agentData.timestamp || 'N/A'}</p>
+                            <p><strong>Total Allocation:</strong> {(totalAllocation * 100).toFixed(2)}%</p>
+                          </div>
+                          <table className="snapshot-table">
+                            <thead>
+                              <tr>
+                                <th>Symbol</th>
+                                <th>Allocation (%)</th>
+                                <th>Price (USDT)</th>
+                                <th>Quantity</th>
+                                <th>Position Value</th>
+                                <th>Average Price</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {symbols.map(([symbol, data]) => (
+                                <tr key={symbol}>
+                                  <td>{symbol}</td>
+                                  <td>{(data.allocation * 100).toFixed(2)}%</td>
+                                  <td>${data.current_price.toFixed(2)}</td>
+                                  <td>{data.quantity.toFixed(6)}</td>
+                                  <td>${data.position_value.toFixed(2)}</td>
+                                  <td>${data.average_price.toFixed(2)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : (
+                <div className="no-data-message">No snapshot data available</div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

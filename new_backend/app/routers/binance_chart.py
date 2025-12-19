@@ -4,9 +4,10 @@ Binance Chart API Router
 차트 데이터를 제공하는 API 엔드포인트입니다.
 """
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from loguru import logger
+import polars as pl
 
 from ..binance_chart_data import BinanceChartDataManager
 
@@ -191,6 +192,95 @@ def get_all_portfolio_weights():
             continue
     
     return {"portfolio_weights": portfolio_weights}
+
+
+@router.get("/binance/chart/snapshot/{close_time}")
+def get_snapshot_at_time(close_time: int):
+    """
+    특정 시점(close_time)의 모든 에이전트의 allocation과 가격 정보를 반환합니다.
+    
+    Args:
+        close_time: 밀리초 단위의 close_time
+    """
+    manager = get_chart_data_manager()
+    manager.load_historical_data()[0]  # 튜플 반환값 무시
+    
+    snapshot_data: Dict[str, Dict[str, Any]] = {}
+    
+    for agent_name in manager.historical_data.keys():
+        try:
+            # 히스토리 데이터에서 해당 close_time의 데이터 찾기
+            historical_df = manager.historical_data[agent_name]
+            if historical_df.is_empty():
+                continue
+            
+            # 실시간 데이터도 로드
+            realtime_df = manager.load_realtime_data(agent_name)
+            
+            # 히스토리와 실시간 데이터 합치기
+            if realtime_df.is_empty():
+                combined_df = historical_df
+            else:
+                combined_df = pl.concat([historical_df, realtime_df], how="vertical", rechunk=True)
+            
+            # 해당 close_time의 데이터 필터링 (정확히 일치하지 않으면 가장 가까운 시간 찾기)
+            snapshot_df = combined_df.filter(pl.col("close_time") == close_time)
+            
+            # 정확히 일치하는 데이터가 없으면 가장 가까운 close_time 찾기
+            if snapshot_df.is_empty():
+                # 모든 close_time과의 차이 계산
+                time_diffs = combined_df.with_columns([
+                    (pl.col("close_time") - close_time).abs().alias("time_diff")
+                ])
+                # 가장 가까운 close_time 찾기
+                closest_df = time_diffs.sort("time_diff").head(1)
+                if not closest_df.is_empty():
+                    closest_row = closest_df.row(0, named=True)
+                    time_diff = closest_row.get("time_diff")
+                    closest_close_time = closest_row.get("close_time")
+                    # 5분(300000ms) 이내의 차이면 해당 시점으로 간주
+                    if time_diff is not None and closest_close_time is not None and time_diff < 300000:
+                        snapshot_df = combined_df.filter(pl.col("close_time") == closest_close_time)
+                    else:
+                        continue
+                else:
+                    continue
+            
+            if snapshot_df.is_empty():
+                continue
+            
+            # 각 심볼별 정보 추출
+            symbols_data: Dict[str, Dict[str, float]] = {}
+            for row in snapshot_df.iter_rows(named=True):
+                symbol = row["symbol"]
+                symbols_data[symbol] = {
+                    "allocation": float(row.get("allocation", 0.0)),
+                    "current_price": float(row.get("current_price", 0.0)),
+                    "quantity": float(row.get("quantity", 0.0)),
+                    "position_value": float(row.get("position_value", 0.0)),
+                    "average_price": float(row.get("average_price", 0.0)),
+                }
+            
+            # timestamp 가져오기
+            timestamp = snapshot_df["timestamp"].first()
+            if timestamp is not None:
+                timestamp_str = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+            else:
+                timestamp_str = None
+            
+            snapshot_data[agent_name] = {
+                "timestamp": timestamp_str,
+                "close_time": close_time,
+                "symbols": symbols_data,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get snapshot for agent {agent_name} at close_time {close_time}: {e}")
+            continue
+    
+    return {
+        "close_time": close_time,
+        "snapshot": snapshot_data
+    }
 
 
 @router.post("/binance/chart/{agent_name}/update")
