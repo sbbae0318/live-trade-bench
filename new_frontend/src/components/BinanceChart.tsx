@@ -127,6 +127,7 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
       [agent: string]: {
         timestamp: string | null;
         close_time: number;
+        last_trade_time: string | null;
         symbols: {
           [symbol: string]: {
             allocation: number;
@@ -1088,7 +1089,7 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
               ) : snapshotData ? (
                 <>
                   <div className="snapshot-info">
-                    <p><strong>Timestamp:</strong> {snapshotData.timestamp || new Date(snapshotData.close_time).toLocaleString()}</p>
+                    <p><strong>Timestamp:</strong> {snapshotData.timestamp ? new Date(snapshotData.timestamp).toLocaleString() : new Date(snapshotData.close_time).toLocaleString()}</p>
                     <p><strong>Close Time:</strong> {snapshotData.close_time}</p>
                   </div>
                   <div className="snapshot-agents">
@@ -1100,7 +1101,8 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
                         <div key={agentName} className="snapshot-agent-section">
                           <h3>{agentName}</h3>
                           <div className="snapshot-agent-info">
-                            <p><strong>Timestamp:</strong> {agentData.timestamp || 'N/A'}</p>
+                            <p><strong>Timestamp:</strong> {agentData.timestamp ? new Date(agentData.timestamp).toLocaleString() : 'N/A'}</p>
+                            <p><strong>Last Trade Time:</strong> {agentData.last_trade_time ? new Date(agentData.last_trade_time).toLocaleString() : 'N/A'}</p>
                             <p><strong>Total Allocation:</strong> {(totalAllocation * 100).toFixed(2)}%</p>
                           </div>
                           <table className="snapshot-table">

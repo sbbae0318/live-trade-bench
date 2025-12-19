@@ -56,6 +56,9 @@ class BinanceChartDataManager:
         # 마지막 거래 파일의 최신 close_time (밀리초, 실시간 데이터 리셋 기준점)
         self.last_trade_close_time_ms: Optional[int] = None
         
+        # 각 에이전트별 마지막 거래 시간 (UTC datetime)
+        self.last_trade_times: Dict[str, datetime] = {}
+        
         # Binance API 기본 URL
         self.binance_api_url = "https://fapi.binance.com"
         
@@ -135,6 +138,36 @@ class BinanceChartDataManager:
         for file_path in sorted(parquet_files):
             try:
                 df = pl.read_parquet(file_path)
+                
+                # last_trade_time 컬럼이 없으면 추가 (UTC 00:05로 fill)
+                if "last_trade_time" not in df.columns:
+                    # 파일명에서 날짜 추출 시도
+                    file_stem = file_path.stem
+                    try:
+                        if len(file_stem) == 17 and "T" in file_stem:
+                            file_date = datetime.strptime(file_stem, "%Y-%m-%dT%H%M%S").date()
+                        else:
+                            # 파일명에서 날짜를 추출할 수 없으면 timestamp에서 추출
+                            if "timestamp" in df.columns and not df.is_empty():
+                                first_timestamp = df["timestamp"].min()
+                                if isinstance(first_timestamp, datetime):
+                                    file_date = first_timestamp.date()
+                                else:
+                                    file_date = datetime.now(timezone.utc).date()
+                            else:
+                                file_date = datetime.now(timezone.utc).date()
+                        default_trade_time = datetime.combine(file_date, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
+                        df = df.with_columns([
+                            pl.lit(default_trade_time).alias("last_trade_time")
+                        ])
+                    except Exception:
+                        # 날짜 파싱 실패 시 오늘 날짜의 UTC 00:05 사용
+                        today = datetime.now(timezone.utc).date()
+                        default_trade_time = datetime.combine(today, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
+                        df = df.with_columns([
+                            pl.lit(default_trade_time).alias("last_trade_time")
+                        ])
+                
                 dfs.append(df)
                 logger.debug(f"Loaded {file_path.name}: {len(df)} rows")
             except Exception as e:
@@ -186,6 +219,16 @@ class BinanceChartDataManager:
         if not new_df.is_empty() and "close_time" in new_df.columns:
             latest_close_time_ms = new_df["close_time"].max()
             self.last_trade_close_time_ms = latest_close_time_ms
+            
+            # 각 에이전트별로 마지막 거래 시간 추출
+            for agent_name in agent_data.keys():
+                agent_df = new_df.filter(pl.col("agent") == agent_name)
+                if not agent_df.is_empty() and "timestamp" in agent_df.columns:
+                    # 최신 timestamp를 마지막 거래 시간으로 저장
+                    latest_timestamp_value = agent_df["timestamp"].max()
+                    if latest_timestamp_value:
+                        self.last_trade_times[agent_name] = latest_timestamp_value
+            
             if latest_timestamp:
                 logger.debug(f"Updated last_loaded_timestamp to {latest_timestamp}, last_trade_close_time_ms to {latest_close_time_ms}")
             else:
@@ -318,6 +361,20 @@ class BinanceChartDataManager:
         # account 정보 가져오기 (최신 히스토리 데이터에서)
         account_info = self.get_account_info_from_data(agent_name)
         
+        # 마지막 거래 시간 가져오기 (히스토리 데이터에서)
+        last_trade_time = self.last_trade_times.get(agent_name)
+        if last_trade_time is None:
+            # 히스토리 데이터에서 최신 timestamp 찾기
+            if agent_name in self.historical_data:
+                hist_df = self.historical_data[agent_name]
+                if not hist_df.is_empty() and "timestamp" in hist_df.columns:
+                    last_trade_time = hist_df["timestamp"].max()
+        
+        # 마지막 거래 시간이 없으면 UTC 00:05로 설정 (기본값)
+        if last_trade_time is None:
+            # 오늘 날짜의 UTC 00:05로 설정
+            today = datetime.now(timezone.utc).date()
+            last_trade_time = datetime.combine(today, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
         
         # 각 심볼별 가격 가져오기
         rows: List[Dict[str, Any]] = []
@@ -344,6 +401,7 @@ class BinanceChartDataManager:
                 "current_price": price,  # 실시간 가격만 업데이트
                 "position_value": position_value,
                 "allocation": allocation,
+                "last_trade_time": last_trade_time,  # 마지막 거래 시간 추가
             })
         
         if not rows:
@@ -453,6 +511,51 @@ class BinanceChartDataManager:
                                 continue
                         if not converted:
                             logger.warning(f"Failed to parse timestamp column in {csv_file_path}, keeping as string")
+                
+                # last_trade_time 컬럼도 datetime으로 변환 (CSV에서 읽을 때 문자열로 읽힘)
+                if "last_trade_time" in existing_df.columns:
+                    if existing_df["last_trade_time"].dtype != pl.Datetime:
+                        try:
+                            existing_df = existing_df.with_columns(
+                                pl.col("last_trade_time").str.to_datetime(strict=False, time_zone="UTC")
+                            )
+                        except Exception:
+                            # 실패하면 여러 형식을 순차적으로 시도
+                            formats = [
+                                "%Y-%m-%d %H:%M:%S%.f %Z",
+                                "%Y-%m-%dT%H:%M:%S%.f%z",
+                                "%Y-%m-%d %H:%M:%S",
+                                "%Y-%m-%dT%H:%M:%S",
+                            ]
+                            converted = False
+                            for fmt in formats:
+                                try:
+                                    existing_df = existing_df.with_columns(
+                                        pl.col("last_trade_time").str.strptime(pl.Datetime, format=fmt, strict=False, time_zone="UTC")
+                                    )
+                                    converted = True
+                                    break
+                                except Exception:
+                                    continue
+                            if not converted:
+                                logger.warning(f"Failed to parse last_trade_time column in {csv_file_path}, keeping as string")
+                
+                # 기존 데이터와 새 데이터 합치기 전에 타입 통일
+                # df의 last_trade_time이 Datetime인지 확인하고, existing_df와 타입이 다르면 변환
+                if "last_trade_time" in df.columns and "last_trade_time" in existing_df.columns:
+                    if df["last_trade_time"].dtype != existing_df["last_trade_time"].dtype:
+                        # df의 last_trade_time이 Datetime이고 existing_df가 String이면, existing_df를 변환
+                        if df["last_trade_time"].dtype == pl.Datetime and existing_df["last_trade_time"].dtype != pl.Datetime:
+                            try:
+                                existing_df = existing_df.with_columns(
+                                    pl.col("last_trade_time").str.to_datetime(strict=False, time_zone="UTC")
+                                )
+                            except Exception:
+                                # 변환 실패 시 df의 last_trade_time을 문자열로 변환
+                                df = df.with_columns(
+                                    pl.col("last_trade_time").cast(pl.Utf8)
+                                )
+                
                 # 기존 데이터와 새 데이터 합치기
                 combined_df = pl.concat([existing_df, df], how="vertical", rechunk=True)
                 # 중복 제거: 같은 close_time, agent, symbol 조합은 하나만 유지 (최신 timestamp 우선)
@@ -524,6 +627,47 @@ class BinanceChartDataManager:
                                 continue
                         if not converted:
                             logger.warning(f"Failed to parse timestamp column in {csv_file_path}, keeping as string")
+                
+                # last_trade_time 컬럼이 없으면 추가 (UTC 00:05로 fill)
+                if "last_trade_time" not in df.columns:
+                    # 날짜 디렉토리 이름에서 날짜 추출
+                    date_str = csv_file_path.parent.name
+                    try:
+                        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        default_trade_time = datetime.combine(date_obj, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
+                        df = df.with_columns([
+                            pl.lit(default_trade_time).alias("last_trade_time")
+                        ])
+                    except Exception:
+                        # 날짜 파싱 실패 시 오늘 날짜의 UTC 00:05 사용
+                        today = datetime.now(timezone.utc).date()
+                        default_trade_time = datetime.combine(today, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
+                        df = df.with_columns([
+                            pl.lit(default_trade_time).alias("last_trade_time")
+                        ])
+                else:
+                    # last_trade_time 컬럼이 있으면 datetime으로 변환
+                    if df["last_trade_time"].dtype != pl.Datetime:
+                        try:
+                            df = df.with_columns(
+                                pl.col("last_trade_time").str.to_datetime(strict=False, time_zone="UTC")
+                            )
+                        except Exception:
+                            formats = [
+                                "%Y-%m-%d %H:%M:%S%.f %Z",
+                                "%Y-%m-%dT%H:%M:%S%.f%z",
+                                "%Y-%m-%d %H:%M:%S",
+                                "%Y-%m-%dT%H:%M:%S",
+                            ]
+                            for fmt in formats:
+                                try:
+                                    df = df.with_columns(
+                                        pl.col("last_trade_time").str.strptime(pl.Datetime, format=fmt, strict=False, time_zone="UTC")
+                                    )
+                                    break
+                                except Exception:
+                                    continue
+                
                 dfs.append(df)
                 file_row_counts[csv_file_path.name] = len(df)
             except Exception as e:

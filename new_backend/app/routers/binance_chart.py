@@ -268,9 +268,43 @@ def get_snapshot_at_time(close_time: int):
             else:
                 timestamp_str = None
             
+            # last_trade_time 가져오기
+            last_trade_time = None
+            if "last_trade_time" in snapshot_df.columns:
+                last_trade_time_value = snapshot_df["last_trade_time"].first()
+                if last_trade_time_value is not None:
+                    if hasattr(last_trade_time_value, "isoformat"):
+                        last_trade_time = last_trade_time_value.isoformat()
+                    else:
+                        last_trade_time = str(last_trade_time_value)
+            
+            # last_trade_time이 없으면 manager의 메모리에서 가져오기
+            if last_trade_time is None:
+                last_trade_time_dt = manager.last_trade_times.get(agent_name)
+                if last_trade_time_dt:
+                    last_trade_time = last_trade_time_dt.isoformat()
+                else:
+                    # 히스토리 데이터에서 최신 timestamp를 last_trade_time으로 사용
+                    if not historical_df.is_empty() and "timestamp" in historical_df.columns:
+                        latest_timestamp = historical_df["timestamp"].max()
+                        if latest_timestamp:
+                            last_trade_time = latest_timestamp.isoformat() if hasattr(latest_timestamp, "isoformat") else str(latest_timestamp)
+            
+            # last_trade_time이 여전히 없으면 UTC 00:05로 설정
+            if last_trade_time is None:
+                from datetime import datetime, timezone
+                # close_time에서 날짜 추출
+                try:
+                    date_obj = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).date()
+                except Exception:
+                    date_obj = datetime.now(timezone.utc).date()
+                default_trade_time = datetime.combine(date_obj, datetime.min.time().replace(hour=0, minute=5), timezone.utc)
+                last_trade_time = default_trade_time.isoformat()
+            
             snapshot_data[agent_name] = {
                 "timestamp": timestamp_str,
                 "close_time": close_time,
+                "last_trade_time": last_trade_time,
                 "symbols": symbols_data,
             }
         except Exception as e:

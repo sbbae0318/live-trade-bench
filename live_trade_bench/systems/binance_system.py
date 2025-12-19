@@ -231,8 +231,12 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
         The file name includes date/time for uniqueness.
         """
         # Build timestamp / close_time epoch ms
+        # 실제 allocation 할당 시점의 시간 사용 (UTC 기준)
         ts_dt = parse_utc_datetime(for_date) if for_date else datetime.now(timezone.utc)
         close_time_ms = int(ts_dt.timestamp() * 1000)
+        
+        # last_trade_time은 실제 trade 실행 시점의 시간 (UTC)
+        last_trade_time = ts_dt
 
         # Build rows for each agent's account positions; include CASH as USDT at price 1.0
         rows: list[dict] = []
@@ -250,6 +254,7 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
                         "current_price": float(getattr(pos, "current_price", 0.0)),
                         "position_value": float(getattr(pos, "market_value", 0.0)),
                         "allocation": float(account.target_allocations.get(symbol, 0.0)),
+                        "last_trade_time": last_trade_time,  # 실제 trade 실행 시점의 시간
                         #"cash_balance": float(account.cash_balance),
                         #"total_value": float(account.get_total_value()),
                     }
@@ -267,6 +272,7 @@ class BinancePortfolioSystem(BitMEXPortfolioSystem):
                         "current_price": 1.0,
                         "position_value": float(account.cash_balance),
                         "allocation": float(account.target_allocations.get("CASH", 0.0)),
+                        "last_trade_time": last_trade_time,  # 실제 trade 실행 시점의 시간
                         #"cash_balance": float(account.cash_balance),
                         #"total_value": float(account.get_total_value()),
                     }
