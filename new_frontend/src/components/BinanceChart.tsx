@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -104,6 +104,37 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [timeUntilNextUpdate, setTimeUntilNextUpdate] = useState<number>(updateInterval);
+  
+  // 시간 범위 프리셋 상태
+  const [timeRangePreset, setTimeRangePreset] = useState<'1day' | '1week' | '1month' | '1year'>('1month');
+  
+  // 스크롤바 상태 (0-100, 현재 보이는 범위의 시작 위치) - 기본값은 맨 오른쪽(최신)
+  const [scrollPosition, setScrollPosition] = useState<number>(100);
+  
+  // 전체 데이터 범위
+  const [dataTimeRange, setDataTimeRange] = useState<{min: number, max: number} | null>(null);
+  
+  // 보이는 시간 범위 계산 (useMemo로 메모이제이션)
+  const visibleTimeRange = useMemo(() => {
+    if (!dataTimeRange) {
+      return { min: 0, max: 0 };
+    }
+    
+    const presetRanges: { [key: string]: number } = {
+      '1day': 24 * 60 * 60 * 1000,
+      '1week': 7 * 24 * 60 * 60 * 1000,
+      '1month': 30 * 24 * 60 * 60 * 1000,
+      '1year': 365 * 24 * 60 * 60 * 1000,
+    };
+    const visibleRange = presetRanges[timeRangePreset];
+    const totalRange = dataTimeRange.max - dataTimeRange.min;
+    const scrollableRange = Math.max(0, totalRange - visibleRange);
+    
+    const startTime = dataTimeRange.min + (scrollableRange * scrollPosition / 100);
+    const newMin = Math.max(dataTimeRange.min, Math.min(dataTimeRange.max - visibleRange, startTime));
+    
+    return { min: newMin, max: newMin + visibleRange };
+  }, [dataTimeRange, timeRangePreset, scrollPosition]);
   
   // 포트폴리오 비중 상태
   const [portfolioWeights, setPortfolioWeights] = useState<{[agent: string]: {
@@ -529,6 +560,35 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
     };
   };
 
+  // 전체 데이터 범위 계산 (useEffect로 분리하여 무한 루프 방지)
+  useEffect(() => {
+    let allTimestamps: number[] = [];
+    
+    agents.forEach(agent => {
+      const data = allAgentsTotalValue[agent] || [];
+      data.forEach(point => {
+        const timestamp = new Date(point.timestamp).getTime();
+        if (!allTimestamps.includes(timestamp)) {
+          allTimestamps.push(timestamp);
+        }
+      });
+    });
+    
+    if (allTimestamps.length > 0) {
+      const minTime = Math.min(...allTimestamps);
+      const maxTime = Math.max(...allTimestamps);
+      const newRange = { min: minTime, max: maxTime };
+      
+      // 기존 범위와 다를 때만 업데이트
+      setDataTimeRange(prevRange => {
+        if (!prevRange || prevRange.min !== minTime || prevRange.max !== maxTime) {
+          return newRange;
+        }
+        return prevRange;
+      });
+    }
+  }, [agents, allAgentsTotalValue]);
+
   // Overview 탭: 모든 에이전트의 total value 차트 데이터
   const getAllAgentsTotalValueChartData = () => {
     const datasets = agents.map((agent, index) => {
@@ -570,6 +630,17 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
     return {
       responsive: true,
       maintainAspectRatio: false,
+      // 성능 최적화: 애니메이션 비활성화 (Chart.js v4 형식)
+      animation: {
+        duration: 0,
+      },
+      // 성능 최적화: 상호작용 최적화
+      interaction: {
+        mode: 'index' as const,
+        intersect: false,
+        // 성능 최적화: hover 시에만 tooltip 표시
+        includeInvisible: false,
+      },
       elements: {
         point: {
           radius: 0,
@@ -587,8 +658,11 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
           text: 'All Agents - Total Portfolio Value Comparison',
         },
         tooltip: {
-          mode: 'index' as const,
-          intersect: false,
+          // tooltip의 mode와 intersect는 최상위 interaction 설정을 따름
+          // 성능 최적화: tooltip 애니메이션 비활성화
+          animation: {
+            duration: 0,
+          },
           callbacks: {
             label: function(context: any) {
               return `${context.dataset.label}: $${context.parsed.y.toFixed(2)}`;
@@ -598,18 +672,18 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
         zoom: {
           zoom: {
             wheel: {
-              enabled: true,
-              speed: 0.1,
+              enabled: false, // 휠 줌 비활성화
             },
             pinch: {
-              enabled: true,
+              enabled: false, // 핀치 줌 비활성화
             },
-            mode: 'x' as const, // x축만 줌 (시간축)
+            mode: 'x' as const,
+            animation: {
+              duration: 0,
+            },
           },
           pan: {
-            enabled: true,
-            mode: 'x' as const, // x축만 팬 (시간축)
-            modifierKey: 'shift' as const, // Shift 키를 누른 상태에서 드래그로 팬
+            enabled: false, // 팬 비활성화
           },
         },
       },
@@ -626,6 +700,18 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
             display: true,
             text: 'Date',
           },
+          // 시간 범위 프리셋과 스크롤바 위치에 따른 min/max 설정
+          min: dataTimeRange ? visibleTimeRange.min : (() => {
+            const now = Date.now();
+            const ranges: { [key: string]: number } = {
+              '1day': now - 24 * 60 * 60 * 1000,
+              '1week': now - 7 * 24 * 60 * 60 * 1000,
+              '1month': now - 30 * 24 * 60 * 60 * 1000,
+              '1year': now - 365 * 24 * 60 * 60 * 1000,
+            };
+            return ranges[timeRangePreset];
+          })(),
+          max: dataTimeRange ? visibleTimeRange.max : Date.now(),
         },
         y: {
           type: 'linear' as const,
@@ -684,10 +770,6 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
         if (event.native) {
           event.native.target.style.cursor = 'pointer';
         }
-      },
-      interaction: {
-        mode: 'index' as const,
-        intersect: false,
       },
     };
   };
@@ -843,59 +925,73 @@ const BinanceChart: React.FC<BinanceChartProps> = ({
             <div className="overview-layout">
               <div className="overview-chart-container">
                 <div className="chart-zoom-controls">
-                  <button 
-                    className="zoom-button"
-                    onClick={() => {
-                      if (overviewChartRef.current) {
-                        const chart = overviewChartRef.current;
-                        if (chart && chart.zoom) {
-                          chart.zoom(1.2);
+                  <div className="zoom-controls-right">
+                    <select
+                      className="time-range-select"
+                      value={timeRangePreset}
+                      onChange={(e) => {
+                        setTimeRangePreset(e.target.value as '1day' | '1week' | '1month' | '1year');
+                        setScrollPosition(100); // 프리셋 변경 시 스크롤바 위치를 맨 오른쪽(최신)으로 설정
+                        // 차트 업데이트를 위해 강제 리렌더링
+                        if (overviewChartRef.current) {
+                          const chart = overviewChartRef.current;
+                          if (chart && chart.update) {
+                            chart.update('none');
+                          }
                         }
-                      }
-                    }}
-                    title="Zoom In"
-                  >
-                    +
-                  </button>
-                  <button 
-                    className="zoom-button"
-                    onClick={() => {
-                      if (overviewChartRef.current) {
-                        const chart = overviewChartRef.current;
-                        if (chart && chart.zoom) {
-                          chart.zoom(0.8);
-                        }
-                      }
-                    }}
-                    title="Zoom Out"
-                  >
-                    −
-                  </button>
-                  <button 
-                    className="zoom-button"
-                    onClick={() => {
-                      if (overviewChartRef.current) {
-                        const chart = overviewChartRef.current;
-                        if (chart && chart.resetZoom) {
-                          chart.resetZoom();
-                        }
-                      }
-                    }}
-                    title="Reset Zoom"
-                  >
-                    ⟲
-                  </button>
-                  <span className="zoom-hint">마우스 휠로 줌, Shift+드래그로 이동</span>
+                      }}
+                    >
+                      <option value="1day">하루</option>
+                      <option value="1week">일주일</option>
+                      <option value="1month">한달</option>
+                      <option value="1year">1년</option>
+                    </select>
+                  </div>
+                  <span className="zoom-hint">아래 스크롤바로 시간 범위 이동</span>
                 </div>
               <div className="chart-wrapper overview-chart">
                 <Line
                     ref={overviewChartRef}
                   data={getAllAgentsTotalValueChartData()}
                   options={getAllAgentsTotalValueChartOptions()}
+                  // 성능 최적화: 차트 업데이트 모드 설정
                   updateMode="none"
                   redraw={false}
                 />
                 </div>
+                {/* 스크롤바 */}
+                {dataTimeRange && (() => {
+                  const presetRanges: { [key: string]: number } = {
+                    '1day': 24 * 60 * 60 * 1000,
+                    '1week': 7 * 24 * 60 * 60 * 1000,
+                    '1month': 30 * 24 * 60 * 60 * 1000,
+                    '1year': 365 * 24 * 60 * 60 * 1000,
+                  };
+                  const visibleRange = presetRanges[timeRangePreset];
+                  const totalRange = dataTimeRange.max - dataTimeRange.min;
+                  const scrollableRange = Math.max(0, totalRange - visibleRange);
+                  const showScrollbar = scrollableRange > 0;
+                  
+                  return (
+                    <div className="chart-scrollbar-container">
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={scrollPosition}
+                        onChange={(e) => {
+                          setScrollPosition(Number(e.target.value));
+                          if (overviewChartRef.current && overviewChartRef.current.update) {
+                            overviewChartRef.current.update('none');
+                          }
+                        }}
+                        className="chart-scrollbar"
+                        disabled={!showScrollbar}
+                        style={{ opacity: showScrollbar ? 1 : 0.5 }}
+                      />
+                    </div>
+                  );
+                })()}
               </div>
               <div className="portfolio-weights-container">
                 <h3 className="portfolio-weights-title">Portfolio Weights</h3>
